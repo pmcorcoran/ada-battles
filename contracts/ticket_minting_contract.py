@@ -41,6 +41,7 @@ def validator(issuer_vkey: bytes, context: ScriptContext) -> None:
         assert issuer_vkey in tx_info.signatories, "Only the studio can authorize creation of new tickets"
         assert is_minting, "Mint amount must be positive"
         assert not is_burning, "Cannot burn tickets during a minting transaction"
+        assert total_amount < 4, "Cannot mint more than 3 tickets at once."
 
     # --- Burning ---
     elif isinstance(redeemer, BurnTicket):
