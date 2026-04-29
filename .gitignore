@@ -1,2 +1,11 @@
 # --- Dependencies ---
 node_modules/
+.venv/
+venv/
+build/
+test-keys/
+.env
+.pytest_cache
+__pycache__
+.pytest_cache/
+__pycache__/
