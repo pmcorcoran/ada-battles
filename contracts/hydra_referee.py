@@ -6,8 +6,7 @@ from opshin.prelude import *
 
 @dataclass
 class BulletState(PlutusData):
-    owner: PubKeyHash
-    is_active: bool  # True if flying
+    is_active: bool  # True if flying, False if ready to fire
     x: int
     y: int
     dir_x: int       # Trajectory X
@@ -28,17 +27,17 @@ class PlayerInput(PlutusData):
     is_shooting: bool            
     aim_dir_x: int
     aim_dir_y: int
-    current_frame: int           # the current game tic
+    current_frame: int           # The current game tic
 
 # constants
-MAX_SPEED = 100    # can be changed
-COOLDOWN_FRAMES = 49  # 1.4 seconds at 35 FPS
+MAX_SPEED = 100    #can be changed
+COOLDOWN_FRAMES = 52  # 1.5 seconds at 35 FPS
 BULLET_SPEED = 200  # Fixed speed for bullets
 MAX_HEALTH = 2
-
 # 
 #  validator
 # 
+
 def validator(datum: PlayerState, redeemer: PlayerInput, context: ScriptContext) -> None:
     tx_info = context.transaction
     redeemer: PlayerInput = context.redeemer
@@ -145,5 +144,6 @@ def validator(datum: PlayerState, redeemer: PlayerInput, context: ScriptContext)
     # higher than their old health, they must prove their killer died.
     
     #if new_datum.health > datum.health:
+ 
  
         #assert players killer is dead.
