@@ -6,6 +6,7 @@ from opshin.prelude import *
 
 @dataclass
 class BulletState(PlutusData):
+    owner: PubKeyHash
     is_active: bool  # True if flying, False if ready to fire
     x: int
     y: int
@@ -31,7 +32,7 @@ class PlayerInput(PlutusData):
 
 # constants
 MAX_SPEED = 100    #can be changed
-COOLDOWN_FRAMES = 52  # 1.5 seconds at 35 FPS
+COOLDOWN_FRAMES = 49  # 1.4 seconds at 35 FPS
 BULLET_SPEED = 200  # Fixed speed for bullets
 MAX_HEALTH = 2
 # 
