@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ADA BATTLES</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a2e;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #gameContainer {
+            position: relative;
+        }
+
+        canvas {
+            display: block;
+            border: 3px solid #16213e;
+            border-radius: 8px;
+            box-shadow: 0 0 30px rgba(0, 255, 255, 0.2);
+        }
+
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 14px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+
+        #healthBar {
+            width: 150px;
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        #healthFill {
+            height: 100%;
+            background: linear-gradient(90deg, #00ff00, #00cc00);
+            transition: width 0.3s;
+        }
+
+        #reloadBar {
+            width: 150px;
+            height: 10px;
+            background: #333;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        #reloadFill {
+            height: 100%;
+            background: linear-gradient(90deg, #ff9900, #ff6600);
+            transition: width 0.1s;
+        }
+
+        #message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            text-align: center;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.7);
+            z-index: 10;
+        }
+
+        .game-over-btn {
+            pointer-events: auto;
+            margin-top: 20px;
+            padding: 12px 30px;
+            font-size: 18px;
+            font-weight: bold;
+            color: white;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .game-over-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(102, 126, 234, 0.6);
+        }
+
+        #playerCount {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            color: white;
+            font-size: 14px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <div id="walletPanel" style="position: absolute; top: 10px; right: 10px; z-index: 20;">
+            <button id="connectBtn" style="padding: 8px 16px; background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;">
+                Connect Wallet
+            </button>
+            <div id="walletList" style="display: none; margin-top: 8px; background: #16213e; border-radius: 6px; padding: 8px; min-width: 180px;"></div>
+            <div id="walletInfo" style="display: none; color: white; font-size: 12px; margin-top: 8px; background: rgba(0,0,0,0.5); padding: 8px; border-radius: 6px;"></div>
+        </div>
+        
+        <canvas id="game" width="900" height="630"></canvas>
+
+        <div id="ui">
+            <div>Health: <span id="healthText">2</span></div>
+            <div id="healthBar"><div id="healthFill" style="width: 100%"></div></div>
+            <div>Reload:</div>
+            <div id="reloadBar"><div id="reloadFill" style="width: 100%"></div></div>
+        </div>
+
+        <div id="playerCount">Players: 0/0</div>
+
+        <div id="sdkInfo" style="position: absolute; bottom: 10px; left: 10px; color: #888; font-size: 11px; display: none;">
+            SDK: <span id="sdkLobbyId">-</span>
+        </div>
+
+        <div id="message"></div>
+    </div>
+
+    <script src="bundle.js"></script>
+</body>
+</html>
