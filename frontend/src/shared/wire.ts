@@ -32,12 +32,16 @@ export const OP = {
   'player-revived':       0x09,
   'game-over':            0x0A,
   'lobby-reset':          0x0B,
+  'revive-available':     0x0C,
   'join-lobby':           0x20,
   'join-spectate':        0x21,
   'request-start':        0x22,
   'request-restart':      0x23,
   'player-input':         0x26,
   'shoot':                0x27,
+  'self-hit':             0x28,
+  'bullet-inactive':      0x29,
+  'request-revive':       0x2A,
 } as const;
 
 const EVENT_BY_OP: Record<number, string> = Object.fromEntries(
@@ -146,7 +150,7 @@ class Reader {
 const strSize = (s: string) => 1 + enc.encode(s).length;
 
 const PLAYER_SIZE = 1 + 2 + 2 + 2 + 1 + 1 + 1;   // slot + x + y + rot + hp + maxHp + elim
-const BULLET_SIZE = 2 + 1 + 2 + 2 + 2;           // id(u16) + ownerSlot(u8) + x + y + rot
+const BULLET_SIZE = 2 + 1 + 2 + 2 + 2 + 2 + 2 + 2 + 2; // id + ownerSlot + prev x/y + x/y + start x/y + rot
 
 //  Encode 
 
@@ -170,6 +174,8 @@ const sizes: SizerMap = {
     1 + 1 + strSize(d.lobbyId),
   'player-eliminated':    (d: { targetSlot: number; killerSlot: number; lobbyId: string }) =>
     1 + 1 + strSize(d.lobbyId),
+  'revive-available':     (d: { slot: number; killerSlot: number; lobbyId: string }) =>
+    1 + 1 + strSize(d.lobbyId),
   'player-revived':       (d: { slot: number; killerSlot: number; lobbyId: string }) =>
     1 + 1 + strSize(d.lobbyId),
   'game-over':            (d: { winnerSlot: number | null; lobbyId: string }) =>
@@ -182,6 +188,9 @@ const sizes: SizerMap = {
   'request-restart':      ()       => 0,
   'player-input':         ()       => 1 + 2,
   'shoot':                ()       => 2,
+  'self-hit':             ()       => 2 + 1 + 1,
+  'bullet-inactive':      ()       => 2,
+  'request-revive':       ()       => 0,
 };
 
 const emitters: EmitterMap = {
@@ -205,8 +214,12 @@ const emitters: EmitterMap = {
     for (const b of d.bullets) {
       w.u16(b.id);
       w.u8(b.ownerSlot);
+      w.pos16(b.prevX);
+      w.pos16(b.prevY);
       w.pos16(b.x);
       w.pos16(b.y);
+      w.pos16(b.startX);
+      w.pos16(b.startY);
       w.rot16(b.rotation);
     }
     w.u8(STATUS_TO_U8[d.status]);
@@ -215,6 +228,7 @@ const emitters: EmitterMap = {
   },
   'player-hit':           (w, d) => { w.u8(d.targetSlot); w.u8(d.health); w.str(d.lobbyId); },
   'player-eliminated':    (w, d) => { w.u8(d.targetSlot); w.u8(d.killerSlot); w.str(d.lobbyId); },
+  'revive-available':     (w, d) => { w.u8(d.slot); w.u8(d.killerSlot); w.str(d.lobbyId); },
   'player-revived':       (w, d) => { w.u8(d.slot); w.u8(d.killerSlot); w.str(d.lobbyId); },
   'game-over':            (w, d) => { w.slotOrNone(d.winnerSlot); w.str(d.lobbyId); },
   'lobby-reset':          (w, d) => { w.str(d.lobbyId); },
@@ -225,6 +239,9 @@ const emitters: EmitterMap = {
   'request-restart':      ()       => { /* empty */ },
   'player-input':         (w, d)   => { w.u8(d.keys & 0x0F); w.rot16(d.rotation); },
   'shoot':                (w, d)   => { w.rot16(d.rotation); },
+  'self-hit':             (w, d)   => { w.u16(d.bulletId); w.u8(d.health); w.bool(d.isEliminated); },
+  'bullet-inactive':      (w, d)   => { w.u16(d.bulletId); },
+  'request-revive':       ()       => { /* empty */ },
 };
 
 export function encode(event: string, data: unknown): Uint8Array {
@@ -268,8 +285,12 @@ const decoders: DecoderMap = {
       bullets.push({
         id:        r.u16(),
         ownerSlot: r.u8(),
+        prevX:     r.pos16(),
+        prevY:     r.pos16(),
         x:         r.pos16(),
         y:         r.pos16(),
+        startX:    r.pos16(),
+        startY:    r.pos16(),
         rotation:  r.rot16(),
       });
     }
@@ -280,6 +301,7 @@ const decoders: DecoderMap = {
   },
   'player-hit':           (r) => ({ targetSlot: r.u8(), health: r.u8(), lobbyId: r.str() }),
   'player-eliminated':    (r) => ({ targetSlot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
+  'revive-available':     (r) => ({ slot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
   'player-revived':       (r) => ({ slot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
   'game-over':            (r) => ({ winnerSlot: r.slotOrNone(), lobbyId: r.str() }),
   'lobby-reset':          (r) => ({ lobbyId: r.str() }),
@@ -290,6 +312,9 @@ const decoders: DecoderMap = {
   'request-restart':      ()  => undefined,
   'player-input':         (r) => ({ keys: r.u8() & 0x0F, rotation: r.rot16() }),
   'shoot':                (r) => ({ rotation: r.rot16() }),
+  'self-hit':             (r) => ({ bulletId: r.u16(), health: r.u8(), isEliminated: r.bool() }),
+  'bullet-inactive':      (r) => ({ bulletId: r.u16() }),
+  'request-revive':       ()  => undefined,
 };
 
 /** Returns null if the buffer is empty, the opcode is unknown, or parsing throws. */
