@@ -115,12 +115,16 @@
     "player-revived": 9,
     "game-over": 10,
     "lobby-reset": 11,
+    "revive-available": 12,
     "join-lobby": 32,
     "join-spectate": 33,
     "request-start": 34,
     "request-restart": 35,
     "player-input": 38,
-    "shoot": 39
+    "shoot": 39,
+    "self-hit": 40,
+    "bullet-inactive": 41,
+    "request-revive": 42
   };
   var EVENT_BY_OP = Object.fromEntries(
     Object.entries(OP).map(([k, v]) => [v, k])
@@ -232,7 +236,7 @@
   };
   var strSize = (s) => 1 + enc.encode(s).length;
   var PLAYER_SIZE = 1 + 2 + 2 + 2 + 1 + 1 + 1;
-  var BULLET_SIZE = 2 + 1 + 2 + 2 + 2;
+  var BULLET_SIZE = 2 + 1 + 2 + 2 + 2 + 2 + 2 + 2 + 2;
   var sizes = {
     "player-id": () => 1,
     "joined-matched-lobby": (d) => strSize(d),
@@ -242,6 +246,7 @@
     "lobby-state": (d) => 1 + d.players.length * PLAYER_SIZE + 1 + d.bullets.length * BULLET_SIZE + 1 + 1 + strSize(d.lobbyId),
     "player-hit": (d) => 1 + 1 + strSize(d.lobbyId),
     "player-eliminated": (d) => 1 + 1 + strSize(d.lobbyId),
+    "revive-available": (d) => 1 + 1 + strSize(d.lobbyId),
     "player-revived": (d) => 1 + 1 + strSize(d.lobbyId),
     "game-over": (d) => 1 + strSize(d.lobbyId),
     "lobby-reset": (d) => strSize(d.lobbyId),
@@ -250,7 +255,10 @@
     "request-start": () => 0,
     "request-restart": () => 0,
     "player-input": () => 1 + 2,
-    "shoot": () => 2
+    "shoot": () => 2,
+    "self-hit": () => 2 + 1 + 1,
+    "bullet-inactive": () => 2,
+    "request-revive": () => 0
   };
   var emitters = {
     "player-id": (w, d) => w.u8(d),
@@ -284,8 +292,12 @@
       for (const b of d.bullets) {
         w.u16(b.id);
         w.u8(b.ownerSlot);
+        w.pos16(b.prevX);
+        w.pos16(b.prevY);
         w.pos16(b.x);
         w.pos16(b.y);
+        w.pos16(b.startX);
+        w.pos16(b.startY);
         w.rot16(b.rotation);
       }
       w.u8(STATUS_TO_U8[d.status]);
@@ -299,6 +311,11 @@
     },
     "player-eliminated": (w, d) => {
       w.u8(d.targetSlot);
+      w.u8(d.killerSlot);
+      w.str(d.lobbyId);
+    },
+    "revive-available": (w, d) => {
+      w.u8(d.slot);
       w.u8(d.killerSlot);
       w.str(d.lobbyId);
     },
@@ -326,6 +343,16 @@
     },
     "shoot": (w, d) => {
       w.rot16(d.rotation);
+    },
+    "self-hit": (w, d) => {
+      w.u16(d.bulletId);
+      w.u8(d.health);
+      w.bool(d.isEliminated);
+    },
+    "bullet-inactive": (w, d) => {
+      w.u16(d.bulletId);
+    },
+    "request-revive": () => {
     }
   };
   function encode(event, data) {
@@ -363,8 +390,12 @@
         bullets.push({
           id: r.u16(),
           ownerSlot: r.u8(),
+          prevX: r.pos16(),
+          prevY: r.pos16(),
           x: r.pos16(),
           y: r.pos16(),
+          startX: r.pos16(),
+          startY: r.pos16(),
           rotation: r.rot16()
         });
       }
@@ -375,6 +406,7 @@
     },
     "player-hit": (r) => ({ targetSlot: r.u8(), health: r.u8(), lobbyId: r.str() }),
     "player-eliminated": (r) => ({ targetSlot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
+    "revive-available": (r) => ({ slot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
     "player-revived": (r) => ({ slot: r.u8(), killerSlot: r.u8(), lobbyId: r.str() }),
     "game-over": (r) => ({ winnerSlot: r.slotOrNone(), lobbyId: r.str() }),
     "lobby-reset": (r) => ({ lobbyId: r.str() }),
@@ -383,7 +415,10 @@
     "request-start": () => void 0,
     "request-restart": () => void 0,
     "player-input": (r) => ({ keys: r.u8() & 15, rotation: r.rot16() }),
-    "shoot": (r) => ({ rotation: r.rot16() })
+    "shoot": (r) => ({ rotation: r.rot16() }),
+    "self-hit": (r) => ({ bulletId: r.u16(), health: r.u8(), isEliminated: r.bool() }),
+    "bullet-inactive": (r) => ({ bulletId: r.u16() }),
+    "request-revive": () => void 0
   };
   function decode(input) {
     if ((input instanceof Uint8Array ? input.length : input.byteLength) === 0) return null;
@@ -426,7 +461,7 @@
         for (const h of arr) h(msg.data);
       });
     }
-    // ── Outbound ──────────────────────────────────────────────────────────────
+    //  Outbound 
     joinLobby(size) {
       this.send("join-lobby", size);
     }
@@ -445,7 +480,16 @@
     sendShoot(rotation) {
       this.send("shoot", { rotation });
     }
-    // ── Inbound ───────────────────────────────────────────────────────────────
+    sendSelfHit(bulletId, health, isEliminated) {
+      this.send("self-hit", { bulletId, health, isEliminated });
+    }
+    sendBulletInactive(bulletId) {
+      this.send("bullet-inactive", { bulletId });
+    }
+    requestRevive() {
+      this.send("request-revive", void 0);
+    }
+    //  Inbound 
     on(event, handler) {
       let arr = this.listeners.get(event);
       if (!arr) {
@@ -460,7 +504,7 @@
       } catch {
       }
     }
-    // ── Internals ─────────────────────────────────────────────────────────────
+    //  Internals 
     send(event, data) {
       const payload = encode(event, data);
       if (this.open) {
@@ -503,11 +547,19 @@
       this.ownerSlot = dto.ownerSlot;
       this.x = dto.x;
       this.y = dto.y;
+      this.prevX = dto.prevX;
+      this.prevY = dto.prevY;
       this.rotation = dto.rotation;
+      this.startX = dto.startX;
+      this.startY = dto.startY;
     }
     applyDTO(dto) {
+      this.prevX = dto.prevX;
+      this.prevY = dto.prevY;
       this.x = dto.x;
       this.y = dto.y;
+      this.startX = dto.startX;
+      this.startY = dto.startY;
       this.rotation = dto.rotation;
     }
   };
@@ -517,7 +569,9 @@
   var CANVAS_HEIGHT = 630;
   var PLAYER_BASE = 18;
   var PLAYER_SIDE = 27;
+  var PLAYER_STROKE_WIDTH = 2;
   var BULLET_RADIUS = 4;
+  var BULLET_MAX_DISTANCE = 1500;
   var RELOAD_TIME = 1500;
   var LOBBY_SIZES = [3, 5, 7];
   var COLORS = {
@@ -683,7 +737,7 @@
       this.messageEl = document.getElementById("message");
       this.playerCountEl = document.getElementById("playerCount");
     }
-    // ── Health ────────────────────────────────────────────────────────────────
+    //  Health 
     updateHealth(current, max) {
       if (!this.healthFill) return;
       const pct = current / max * 100;
@@ -693,13 +747,13 @@
         this.healthText.textContent = current.toString();
       }
     }
-    // ── Reload ────────────────────────────────────────────────────────────────
+    //  Reload 
     setReloadProgress(progress) {
       if (this.reloadFill) {
         this.reloadFill.style.width = `${Math.min(progress, 1) * 100}%`;
       }
     }
-    // ── Center message ────────────────────────────────────────────────────────
+    //  Center message 
     showMessage(html) {
       if (this.messageEl) {
         this.messageEl.innerHTML = html;
@@ -711,7 +765,7 @@
         this.messageEl.style.display = "none";
       }
     }
-    // ── Player count ──────────────────────────────────────────────────────────
+    //  Player count 
     updatePlayerCount(alive, max) {
       if (this.playerCountEl) {
         this.playerCountEl.textContent = `Players: ${alive}/${max}`;
@@ -719,17 +773,76 @@
     }
   };
 
+  // src/shared/collision.ts
+  function getPlayerTriangle(px, py, rotation) {
+    const cos = Math.cos(rotation);
+    const sin = Math.sin(rotation);
+    const halfBase = PLAYER_BASE / 2;
+    return [
+      { x: px + PLAYER_SIDE * cos, y: py + PLAYER_SIDE * sin },
+      { x: px - halfBase * cos + halfBase * sin, y: py - halfBase * sin - halfBase * cos },
+      { x: px - halfBase * cos - halfBase * sin, y: py - halfBase * sin + halfBase * cos }
+    ];
+  }
+  function getPlayerHitTriangle(px, py, rotation) {
+    const verts = getPlayerTriangle(px, py, rotation);
+    const cx = (verts[0].x + verts[1].x + verts[2].x) / 3;
+    const cy = (verts[0].y + verts[1].y + verts[2].y) / 3;
+    const pad = PLAYER_STROKE_WIDTH / 2;
+    return verts.map((v) => {
+      const dx = v.x - cx;
+      const dy = v.y - cy;
+      const len = Math.hypot(dx, dy);
+      return {
+        x: v.x + dx / len * pad,
+        y: v.y + dy / len * pad
+      };
+    });
+  }
+  function circleTouchesTriangle(cx, cy, r, a, b, c) {
+    const p = { x: cx, y: cy };
+    if (pointInTriangle(p, a, b, c)) return true;
+    if (distToSegment(p, a, b) < r) return true;
+    if (distToSegment(p, b, c) < r) return true;
+    if (distToSegment(p, c, a) < r) return true;
+    return false;
+  }
+  function pointInTriangle(p, a, b, c) {
+    const d1 = sign(p, a, b);
+    const d2 = sign(p, b, c);
+    const d3 = sign(p, c, a);
+    const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+    const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(hasNeg && hasPos);
+  }
+  function sign(p1, p2, p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+  }
+  function distToSegment(p, a, b) {
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const apx = p.x - a.x;
+    const apy = p.y - a.y;
+    const lenSq = abx * abx + aby * aby;
+    if (lenSq === 0) return Math.hypot(apx, apy);
+    const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / lenSq));
+    return Math.hypot(p.x - (a.x + t * abx), p.y - (a.y + t * aby));
+  }
+
   // src/client/game/scenes/GameScene.ts
   var GameScene = class {
     constructor(canvas2) {
       // ── Entity stores ───────────────────────────────────────────────────────
       this.players = /* @__PURE__ */ new Map();
       this.bullets = /* @__PURE__ */ new Map();
+      this.inactiveBulletIds = /* @__PURE__ */ new Set();
+      this.clientPlayerStates = /* @__PURE__ */ new Map();
       // ── State ───────────────────────────────────────────────────────────────
       this.status = "menu";
       this.maxPlayers = 3;
       this.countdownTime = 10;
       this.isSpectator = false;
+      this.reviveRequested = false;
       // Weapon
       this.canShoot = true;
       this.reloadStartMs = 0;
@@ -768,6 +881,7 @@
       });
       this.net.on("player-left", (data) => {
         if (data.lobbyId !== this.net.lobbyId) return;
+        this.clientPlayerStates.delete(data.slot);
         this.refreshPlayerCount();
       });
       this.net.on("countdown", (data) => {
@@ -782,11 +896,31 @@
       });
       this.net.on("player-hit", (data) => {
         if (data.lobbyId !== this.net.lobbyId) return;
+        this.setClientPlayerState(data.targetSlot, data.health, data.health <= 0);
         this.refreshHUD();
+        this.refreshPlayerCount();
       });
-      this.net.on("player-eliminated", (_data) => {
+      this.net.on("player-eliminated", (data) => {
+        if (data.lobbyId !== this.net.lobbyId) return;
+        this.setClientPlayerState(data.targetSlot, 0, true);
+        this.refreshHUD();
+        this.refreshPlayerCount();
       });
-      this.net.on("player-revived", (_data) => {
+      this.net.on("revive-available", (data) => {
+        if (data.lobbyId !== this.net.lobbyId || data.slot !== this.net.localSlot) return;
+        if (!this.isSpectator && !this.reviveRequested) {
+          this.reviveRequested = true;
+          this.net.requestRevive();
+        }
+      });
+      this.net.on("player-revived", (data) => {
+        if (data.lobbyId !== this.net.lobbyId) return;
+        this.setClientPlayerState(data.slot, 1, false);
+        if (data.slot === this.net.localSlot) {
+          this.reviveRequested = false;
+        }
+        this.refreshHUD();
+        this.refreshPlayerCount();
       });
       this.net.on("game-over", (data) => {
         if (data.lobbyId !== this.net.lobbyId) return;
@@ -796,19 +930,49 @@
       this.net.on("lobby-reset", (data) => {
         if (data.lobbyId !== this.net.lobbyId) return;
         this.status = "lobby";
+        this.resetClientAuthorityState();
         this.hud.hideMessage();
       });
     }
     // ── State application ─────────────────────────────────────────────────
     applyLobbyState(state) {
       this.status = state.status;
-      this.players.clear();
-      for (const dto of state.players) {
-        this.players.set(dto.slot, new PlayerComponent(dto));
+      if (state.status !== "playing") {
+        this.resetClientAuthorityState();
       }
-      this.bullets.clear();
+      const serverBulletIds = new Set(state.bullets.map((b) => b.id));
+      for (const id of this.inactiveBulletIds) {
+        if (!serverBulletIds.has(id)) this.inactiveBulletIds.delete(id);
+      }
+      this.players.clear();
+      const playerSlots = /* @__PURE__ */ new Set();
+      for (const dto of state.players) {
+        const player = new PlayerComponent(dto);
+        playerSlots.add(dto.slot);
+        const clientState = this.clientPlayerStates.get(dto.slot);
+        if (state.status === "playing" && clientState) {
+          player.health = clientState.health;
+          player.isEliminated = clientState.isEliminated;
+        }
+        this.players.set(dto.slot, player);
+      }
+      for (const slot of this.clientPlayerStates.keys()) {
+        if (!playerSlots.has(slot)) this.clientPlayerStates.delete(slot);
+      }
+      const nextBullets = /* @__PURE__ */ new Map();
       for (const dto of state.bullets) {
-        this.bullets.set(dto.id, new BulletComponent(dto));
+        if (this.inactiveBulletIds.has(dto.id)) continue;
+        const existing = this.bullets.get(dto.id);
+        if (existing) {
+          existing.applyDTO(dto);
+          nextBullets.set(dto.id, existing);
+        } else {
+          nextBullets.set(dto.id, new BulletComponent(dto));
+        }
+      }
+      this.bullets = nextBullets;
+      if (state.status === "playing") {
+        this.applyClientBulletAuthority();
       }
       if (state.status === "ended" && state.winnerSlot !== null) {
         this.showEndScreen(state.winnerSlot === this.net.localSlot);
@@ -821,6 +985,7 @@
     // ── Scene interface ───────────────────────────────────────────────────
     update(_dt) {
       if (this.status !== "playing") return;
+      this.applyClientBulletAuthority();
       const local = this.players.get(this.net.localSlot);
       if (!local || !local.isAlive || this.isSpectator) return;
       let keys = 0;
@@ -866,6 +1031,64 @@
       this.canShoot = false;
       this.reloadStartMs = Date.now();
       this.hud.setReloadProgress(0);
+    }
+    // ── Client-owned combat outcomes ─────────────────────────────────────
+    applyClientBulletAuthority() {
+      for (const bullet of [...this.bullets.values()]) {
+        if (this.isBulletOutOfBounds(bullet)) {
+          this.markBulletInactive(bullet.id, !this.isSpectator && bullet.ownerSlot === this.net.localSlot);
+          continue;
+        }
+        const hitPlayer = this.findBulletHitPlayer(bullet);
+        if (hitPlayer) {
+          this.applyPredictedHit(bullet, hitPlayer);
+        }
+      }
+    }
+    isBulletOutOfBounds(bullet) {
+      const dx = bullet.x - bullet.startX;
+      const dy = bullet.y - bullet.startY;
+      return bullet.x < -BULLET_RADIUS || bullet.x > CANVAS_WIDTH + BULLET_RADIUS || bullet.y < -BULLET_RADIUS || bullet.y > CANVAS_HEIGHT + BULLET_RADIUS || Math.hypot(dx, dy) > BULLET_MAX_DISTANCE;
+    }
+    bulletHitsPlayer(bullet, player) {
+      const [v0, v1, v2] = getPlayerHitTriangle(player.x, player.y, player.rotation);
+      const dx = bullet.x - bullet.prevX;
+      const dy = bullet.y - bullet.prevY;
+      const distance = Math.hypot(dx, dy);
+      const steps = Math.max(1, Math.ceil(distance / BULLET_RADIUS));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const x = bullet.prevX + dx * t;
+        const y = bullet.prevY + dy * t;
+        if (circleTouchesTriangle(x, y, BULLET_RADIUS, v0, v1, v2)) return true;
+      }
+      return false;
+    }
+    findBulletHitPlayer(bullet) {
+      for (const player of this.players.values()) {
+        if (!player.isAlive || player.slot === bullet.ownerSlot) continue;
+        if (this.bulletHitsPlayer(bullet, player)) return player;
+      }
+      return null;
+    }
+    applyPredictedHit(bullet, target) {
+      const nextHealth = Math.max(0, target.health - 1);
+      const isEliminated = nextHealth <= 0;
+      this.markBulletInactive(bullet.id, false);
+      this.setClientPlayerState(target.slot, nextHealth, isEliminated);
+      if (!this.isSpectator && target.slot === this.net.localSlot) {
+        this.net.sendSelfHit(bullet.id, nextHealth, isEliminated);
+      }
+      this.refreshHUD();
+      this.refreshPlayerCount();
+    }
+    markBulletInactive(bulletId, notifyServer) {
+      if (this.inactiveBulletIds.has(bulletId)) return;
+      this.inactiveBulletIds.add(bulletId);
+      this.bullets.delete(bulletId);
+      if (notifyServer) {
+        this.net.sendBulletInactive(bulletId);
+      }
     }
     // ── Click handling (canvas-based menus) ───────────────────────────────
     bindCanvasClick() {
@@ -919,6 +1142,19 @@
     refreshHUD() {
       const local = this.players.get(this.net.localSlot);
       if (local) this.hud.updateHealth(local.health, local.maxHealth);
+    }
+    setClientPlayerState(slot, health, isEliminated) {
+      this.clientPlayerStates.set(slot, { health, isEliminated });
+      const player = this.players.get(slot);
+      if (player) {
+        player.health = health;
+        player.isEliminated = isEliminated;
+      }
+    }
+    resetClientAuthorityState() {
+      this.reviveRequested = false;
+      this.inactiveBulletIds.clear();
+      this.clientPlayerStates.clear();
     }
     showEndScreen(isWinner) {
       const label = isWinner ? "\u{1F389} You Win!" : "\u{1F480} Game Over";

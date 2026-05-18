@@ -75,6 +75,18 @@ export class NetworkClient {
     this.send('shoot', { rotation });
   }
 
+  sendSelfHit(bulletId: number, health: number, isEliminated: boolean): void {
+    this.send('self-hit', { bulletId, health, isEliminated });
+  }
+
+  sendBulletInactive(bulletId: number): void {
+    this.send('bullet-inactive', { bulletId });
+  }
+
+  requestRevive(): void {
+    this.send('request-revive', undefined);
+  }
+
   //  Inbound 
 
   on<K extends keyof ServerToClientEvents>(

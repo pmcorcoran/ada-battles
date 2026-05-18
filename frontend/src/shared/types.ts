@@ -33,8 +33,12 @@ export interface PlayerDTO {
 export interface BulletDTO {
   id: number;
   ownerSlot: number;
+  prevX: number;
+  prevY: number;
   x: number;
   y: number;
+  startX: number;
+  startY: number;
   rotation: number;
 }
 
@@ -61,6 +65,7 @@ export interface ServerToClientEvents {
   'lobby-state':        (state: LobbyStateDTO) => void;
   'player-hit':         (data: { targetSlot: number; health: number; lobbyId: string }) => void;
   'player-eliminated':  (data: { targetSlot: number; killerSlot: number; lobbyId: string }) => void;
+  'revive-available':   (data: { slot: number; killerSlot: number; lobbyId: string }) => void;
   'player-revived':     (data: { slot: number; killerSlot: number; lobbyId: string }) => void;
   'game-over':          (data: { winnerSlot: number | null; lobbyId: string }) => void;
   'lobby-reset':        (data: { lobbyId: string }) => void;
@@ -74,4 +79,7 @@ export interface ClientToServerEvents {
   'request-restart': () => void;
   'player-input':    (data: { keys: number; rotation: number }) => void;
   'shoot':           (data: { rotation: number }) => void;
+  'self-hit':        (data: { bulletId: number; health: number; isEliminated: boolean }) => void;
+  'bullet-inactive': (data: { bulletId: number }) => void;
+  'request-revive':  () => void;
 }
