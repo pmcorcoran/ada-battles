@@ -1,0 +1,69 @@
+# Local dev orchestration.
+#
+# `docker compose up` boots just the matchmaker. It spawns lobby-runner
+# containers on demand via the host Docker socket. Both services share
+# the `ada-battles-net` network so the matchmaker can reach runners by
+# container name and clients can reach runners through the matchmaker's
+# returned URL.
+#
+# Browser clients connect to:
+#   POST http://localhost:8080/api/lobbies/match  →  { wsUrl: "ws://localhost:8080/lobby/<id>" }
+#
+# (The matchmaker rewrites internal `ws://runner-<id>:3000` to a public
+# URL; for local dev we tunnel through the matchmaker via a websocket
+# proxy — see the proxy note at the bottom. Simpler alternative for dev
+# is to publish each runner on its own host port; we don't do that here
+# because the port-rewriting logic would clutter the matchmaker code.)
+
+services:
+  matchmaker:
+    image: ada-battles:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DOCKER_GID: ${DOCKER_GID:-999}
+    container_name: ada-battles-matchmaker
+    ports:
+      - "8080:8080"
+    environment:
+      PORT:             "8080"
+      RUNNER_IMAGE:     "ada-battles:latest"
+      RUNNER_NETWORK:   "ada-battles-net"
+      PUBLIC_WS_HOST:   "localhost"
+      AUTH_SECRET:      "${AUTH_SECRET}"
+    volumes:
+      # Allow the matchmaker to spawn sibling containers via the host's
+      # Docker socket. In production, use a Kubernetes ServiceAccount
+      # with `pods/create` permissions instead — this socket bind is
+      # development-only and gives root-equivalent power on the host.
+      #- /var/run/docker.sock:/var/run/docker.sock
+      - ${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock
+    networks:
+      - ada-battles-net
+    restart: unless-stopped
+
+networks:
+  # Pre-create with: `docker network create ada-battles-net`
+  # or let compose do it on first up.
+  ada-battles-net:
+    name: ada-battles-net
+    driver: bridge
+
+# ── Notes ──────────────────────────────────────────────────────────
+#
+# Why is there only one service here?
+# Runners are *spawned by the matchmaker*, not declared in compose. The
+# matchmaker calls the Docker API to create them as siblings on the same
+# network. Compose owns the matchmaker; the matchmaker owns the runners.
+#
+# Reaching runners from the browser:
+# In dev, the simplest workable approach is to run a tiny WS-proxying
+# reverse proxy in the matchmaker itself, routing `ws://localhost:8080/lobby/<id>`
+# to `ws://runner-<id>:3000`. That's ~30 lines with `http-proxy` and is
+# left as an exercise — see the `publicUrlFor` hook in matchmaker.ts.
+# Production deployments would use an ingress (nginx, Traefik, k8s
+# Ingress) doing the same path-based routing.
+#
+# Cleaning up dangling runners after a crash:
+#   docker ps --filter "label=ada-battles.role=lobby-runner" -q | xargs -r docker rm -f
