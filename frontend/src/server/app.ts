@@ -13,7 +13,6 @@ import type { ServerToClientEvents, ClientToServerEvents } from '../shared/types
 import { LobbyManager } from './LobbyManager';
 import type { Lobby, ServerPlayer } from './Lobby';
 import { WebSocketHub } from './WebSocketHub';
-import { PLAYER_SIDE, BULLET_RADIUS } from '../shared/constants';
 import { AuthService } from './auth/authService';
 import { createAuthRouter } from './auth/authRoutes';
 
@@ -126,23 +125,23 @@ hub.on('connection', (socket) => {
   });
 
   socket.on('player-input', (data) => {
-    if (currentPlayer && currentLobby && currentPlayer.health > 0 && currentLobby.status === 'playing') {
-      currentPlayer.inputKeys = data.keys & 0x0F;
-      currentPlayer.rotation  = data.rotation;
-    }
+    currentLobby?.setPlayerInput(socket.id, data.keys, data.rotation);
   });
 
   socket.on('shoot', (data) => {
-    if (currentPlayer && currentLobby && currentPlayer.health > 0 && currentLobby.status === 'playing') {
-      const bx = currentPlayer.x + Math.cos(data.rotation) * (PLAYER_SIDE + BULLET_RADIUS);
-      const by = currentPlayer.y + Math.sin(data.rotation) * (PLAYER_SIDE + BULLET_RADIUS);
-      currentLobby.addBullet({
-        x: bx,
-        y: by,
-        rotation: data.rotation,
-        ownerId: socket.id,
-      });
-    }
+    currentLobby?.tryShoot(socket.id, data.rotation);
+  });
+
+  socket.on('self-hit', (data) => {
+    currentLobby?.applySelfHit(socket.id, data);
+  });
+
+  socket.on('bullet-inactive', (data) => {
+    currentLobby?.deactivateOwnedBullet(socket.id, data.bulletId);
+  });
+
+  socket.on('request-revive', () => {
+    currentLobby?.requestRevive(socket.id);
   });
 
   //  Disconnect 

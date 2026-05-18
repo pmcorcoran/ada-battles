@@ -24,7 +24,19 @@ import {
 } from '../systems/RenderSystem';
 import { HUDSystem } from '../systems/HUDSystem';
 import type { LobbyStateDTO, LobbyStatus } from '../../../shared/types';
-import { RELOAD_TIME } from '../../../shared/constants';
+import {
+  BULLET_MAX_DISTANCE,
+  BULLET_RADIUS,
+  CANVAS_HEIGHT,
+  CANVAS_WIDTH,
+  RELOAD_TIME,
+} from '../../../shared/constants';
+import { circleTouchesTriangle, getPlayerHitTriangle } from '../../../shared/collision';
+
+interface ClientPlayerCombatState {
+  health: number;
+  isEliminated: boolean;
+}
 
 export class GameScene implements Scene {
   // ── Dependencies ────────────────────────────────────────────────────────
@@ -38,6 +50,8 @@ export class GameScene implements Scene {
 
   private players = new Map<number, PlayerComponent>();
   private bullets = new Map<number, BulletComponent>();
+  private inactiveBulletIds = new Set<number>();
+  private clientPlayerStates = new Map<number, ClientPlayerCombatState>();
 
   // ── State ───────────────────────────────────────────────────────────────
 
@@ -45,6 +59,7 @@ export class GameScene implements Scene {
   private maxPlayers  = 3;
   private countdownTime = 10;
   private isSpectator = false;
+  private reviveRequested = false;
 
   // Weapon
   private canShoot       = true;
@@ -94,6 +109,7 @@ export class GameScene implements Scene {
 
     this.net.on('player-left', (data) => {
       if (data.lobbyId !== this.net.lobbyId) return;
+      this.clientPlayerStates.delete(data.slot);
       this.refreshPlayerCount();
     });
 
@@ -111,11 +127,35 @@ export class GameScene implements Scene {
 
     this.net.on('player-hit', (data) => {
       if (data.lobbyId !== this.net.lobbyId) return;
+      this.setClientPlayerState(data.targetSlot, data.health, data.health <= 0);
       this.refreshHUD();
+      this.refreshPlayerCount();
     });
 
-    this.net.on('player-eliminated', (_data) => { /* could add death FX */ });
-    this.net.on('player-revived', (_data) => { /* could add revival FX */ });
+    this.net.on('player-eliminated', (data) => {
+      if (data.lobbyId !== this.net.lobbyId) return;
+      this.setClientPlayerState(data.targetSlot, 0, true);
+      this.refreshHUD();
+      this.refreshPlayerCount();
+    });
+
+    this.net.on('revive-available', (data) => {
+      if (data.lobbyId !== this.net.lobbyId || data.slot !== this.net.localSlot) return;
+      if (!this.isSpectator && !this.reviveRequested) {
+        this.reviveRequested = true;
+        this.net.requestRevive();
+      }
+    });
+
+    this.net.on('player-revived', (data) => {
+      if (data.lobbyId !== this.net.lobbyId) return;
+      this.setClientPlayerState(data.slot, 1, false);
+      if (data.slot === this.net.localSlot) {
+        this.reviveRequested = false;
+      }
+      this.refreshHUD();
+      this.refreshPlayerCount();
+    });
 
     this.net.on('game-over', (data) => {
       if (data.lobbyId !== this.net.lobbyId) return;
@@ -126,6 +166,7 @@ export class GameScene implements Scene {
     this.net.on('lobby-reset', (data) => {
       if (data.lobbyId !== this.net.lobbyId) return;
       this.status = 'lobby';
+      this.resetClientAuthorityState();
       this.hud.hideMessage();
     });
   }
@@ -134,17 +175,49 @@ export class GameScene implements Scene {
 
   private applyLobbyState(state: LobbyStateDTO): void {
     this.status = state.status;
+    if (state.status !== 'playing') {
+      this.resetClientAuthorityState();
+    }
+
+    const serverBulletIds = new Set(state.bullets.map((b) => b.id));
+    for (const id of this.inactiveBulletIds) {
+      if (!serverBulletIds.has(id)) this.inactiveBulletIds.delete(id);
+    }
 
     // Sync players
     this.players.clear();
+    const playerSlots = new Set<number>();
     for (const dto of state.players) {
-      this.players.set(dto.slot, new PlayerComponent(dto));
+      const player = new PlayerComponent(dto);
+      playerSlots.add(dto.slot);
+
+      const clientState = this.clientPlayerStates.get(dto.slot);
+      if (state.status === 'playing' && clientState) {
+        player.health = clientState.health;
+        player.isEliminated = clientState.isEliminated;
+      }
+      this.players.set(dto.slot, player);
+    }
+    for (const slot of this.clientPlayerStates.keys()) {
+      if (!playerSlots.has(slot)) this.clientPlayerStates.delete(slot);
     }
 
-    // Sync bullets
-    this.bullets.clear();
+    // Sync bullets while preserving each client's observed spawn point.
+    const nextBullets = new Map<number, BulletComponent>();
     for (const dto of state.bullets) {
-      this.bullets.set(dto.id, new BulletComponent(dto));
+      if (this.inactiveBulletIds.has(dto.id)) continue;
+      const existing = this.bullets.get(dto.id);
+      if (existing) {
+        existing.applyDTO(dto);
+        nextBullets.set(dto.id, existing);
+      } else {
+        nextBullets.set(dto.id, new BulletComponent(dto));
+      }
+    }
+    this.bullets = nextBullets;
+
+    if (state.status === 'playing') {
+      this.applyClientBulletAuthority();
     }
 
     if (state.status === 'ended' && state.winnerSlot !== null) {
@@ -161,6 +234,8 @@ export class GameScene implements Scene {
 
   update(_dt: number): void {
     if (this.status !== 'playing') return;
+
+    this.applyClientBulletAuthority();
 
     const local = this.players.get(this.net.localSlot);
     if (!local || !local.isAlive || this.isSpectator) return;
@@ -229,6 +304,85 @@ export class GameScene implements Scene {
     this.hud.setReloadProgress(0);
   }
 
+  // ── Client-owned combat outcomes ─────────────────────────────────────
+
+  private applyClientBulletAuthority(): void {
+    for (const bullet of [...this.bullets.values()]) {
+      if (this.isBulletOutOfBounds(bullet)) {
+        this.markBulletInactive(bullet.id, !this.isSpectator && bullet.ownerSlot === this.net.localSlot);
+        continue;
+      }
+
+      const hitPlayer = this.findBulletHitPlayer(bullet);
+      if (hitPlayer) {
+        this.applyPredictedHit(bullet, hitPlayer);
+      }
+    }
+  }
+
+  private isBulletOutOfBounds(bullet: BulletComponent): boolean {
+    const dx = bullet.x - bullet.startX;
+    const dy = bullet.y - bullet.startY;
+
+    return (
+      bullet.x < -BULLET_RADIUS ||
+      bullet.x > CANVAS_WIDTH + BULLET_RADIUS ||
+      bullet.y < -BULLET_RADIUS ||
+      bullet.y > CANVAS_HEIGHT + BULLET_RADIUS ||
+      Math.hypot(dx, dy) > BULLET_MAX_DISTANCE
+    );
+  }
+
+  private bulletHitsPlayer(bullet: BulletComponent, player: PlayerComponent): boolean {
+    const [v0, v1, v2] = getPlayerHitTriangle(player.x, player.y, player.rotation);
+    const dx = bullet.x - bullet.prevX;
+    const dy = bullet.y - bullet.prevY;
+    const distance = Math.hypot(dx, dy);
+    const steps = Math.max(1, Math.ceil(distance / BULLET_RADIUS));
+
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = bullet.prevX + dx * t;
+      const y = bullet.prevY + dy * t;
+      if (circleTouchesTriangle(x, y, BULLET_RADIUS, v0, v1, v2)) return true;
+    }
+
+    return false;
+  }
+
+  private findBulletHitPlayer(bullet: BulletComponent): PlayerComponent | null {
+    for (const player of this.players.values()) {
+      if (!player.isAlive || player.slot === bullet.ownerSlot) continue;
+      if (this.bulletHitsPlayer(bullet, player)) return player;
+    }
+    return null;
+  }
+
+  private applyPredictedHit(bullet: BulletComponent, target: PlayerComponent): void {
+    const nextHealth = Math.max(0, target.health - 1);
+    const isEliminated = nextHealth <= 0;
+
+    this.markBulletInactive(bullet.id, false);
+    this.setClientPlayerState(target.slot, nextHealth, isEliminated);
+
+    if (!this.isSpectator && target.slot === this.net.localSlot) {
+      this.net.sendSelfHit(bullet.id, nextHealth, isEliminated);
+    }
+    this.refreshHUD();
+    this.refreshPlayerCount();
+  }
+
+  private markBulletInactive(bulletId: number, notifyServer: boolean): void {
+    if (this.inactiveBulletIds.has(bulletId)) return;
+
+    this.inactiveBulletIds.add(bulletId);
+    this.bullets.delete(bulletId);
+
+    if (notifyServer) {
+      this.net.sendBulletInactive(bulletId);
+    }
+  }
+
   // ── Click handling (canvas-based menus) ───────────────────────────────
 
   private bindCanvasClick(): void {
@@ -291,6 +445,22 @@ export class GameScene implements Scene {
   private refreshHUD(): void {
     const local = this.players.get(this.net.localSlot);
     if (local) this.hud.updateHealth(local.health, local.maxHealth);
+  }
+
+  private setClientPlayerState(slot: number, health: number, isEliminated: boolean): void {
+    this.clientPlayerStates.set(slot, { health, isEliminated });
+
+    const player = this.players.get(slot);
+    if (player) {
+      player.health = health;
+      player.isEliminated = isEliminated;
+    }
+  }
+
+  private resetClientAuthorityState(): void {
+    this.reviveRequested = false;
+    this.inactiveBulletIds.clear();
+    this.clientPlayerStates.clear();
   }
 
   private showEndScreen(isWinner: boolean): void {

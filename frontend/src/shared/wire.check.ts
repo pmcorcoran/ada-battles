@@ -29,7 +29,17 @@ const cases: Case[] = [
         { slot: 1, x: -5.5,  y: 700.1, rotation: 6.28, health: 0, maxHealth: 2, isEliminated: true  },
       ],
       bullets: [
-        { id: 99, ownerSlot: 0, x: 400.0, y: 300.0, rotation: 0 },
+        {
+          id: 99,
+          ownerSlot: 0,
+          prevX: 390.0,
+          prevY: 300.0,
+          x: 400.0,
+          y: 300.0,
+          startX: 380.0,
+          startY: 300.0,
+          rotation: 0,
+        },
       ],
       status: 'playing',
       winnerSlot: null,
@@ -49,6 +59,7 @@ const cases: Case[] = [
   },
   { event: 'player-hit',         data: { targetSlot: 0, health: 1, lobbyId: 'lob' } },
   { event: 'player-eliminated',  data: { targetSlot: 0, killerSlot: 1, lobbyId: 'lob' } },
+  { event: 'revive-available',   data: { slot: 0, killerSlot: 1, lobbyId: 'lob' } },
   { event: 'player-revived',     data: { slot: 0, killerSlot: 1, lobbyId: 'lob' } },
   { event: 'game-over',          data: { winnerSlot: 0, lobbyId: 'lob' } },
   { event: 'game-over',          note: 'no winner',  data: { winnerSlot: null, lobbyId: 'lob' } },
@@ -60,6 +71,9 @@ const cases: Case[] = [
   { event: 'request-restart',    data: undefined },
   { event: 'player-input',       data: { keys: 0b1010, rotation: 0.785 } },
   { event: 'shoot',              data: { rotation: 2.0 } },
+  { event: 'self-hit',           data: { bulletId: 99, health: 1, isEliminated: false } },
+  { event: 'bullet-inactive',    data: { bulletId: 99 } },
+  { event: 'request-revive',     data: undefined },
 ];
 
 function roundTrip(c: Case): { ok: boolean; bytes: Uint8Array; decoded: unknown; err?: string } {

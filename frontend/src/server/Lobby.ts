@@ -16,11 +16,10 @@ import {
   PLAYER_SPEED,
   BULLET_SPEED,
   BULLET_RADIUS,
-  BULLET_MAX_DISTANCE,
+  RELOAD_TIME,
   SERVER_TICK_MS,
   COUNTDOWN_SECONDS,
 } from '../shared/constants';
-import { circleTouchesTriangle, getPlayerHitTriangle } from '../shared/collision';
 import type { LobbyStatus } from '../shared/types';
 
 //  Internal entity types (never serialised directly) 
@@ -37,6 +36,7 @@ export interface ServerPlayer {
   maxHealth: number;
   eliminatedBy: string | null;
   canBeRevived: boolean;
+  lastShotAtMs: number;
 }
 
 export interface ServerBullet {
@@ -45,6 +45,8 @@ export interface ServerBullet {
   ownerSlot: number;
   x: number;
   y: number;
+  prevX: number;
+  prevY: number;
   rotation: number;
   startX: number;
   startY: number;
@@ -65,6 +67,13 @@ function randomPosition(): { x: number; y: number } {
     x: margin + Math.random() * (CANVAS_WIDTH  - 2 * margin),
     y: margin + Math.random() * (CANVAS_HEIGHT - 2 * margin),
   };
+}
+
+function normalizeRotation(rotation: number): number {
+  if (!Number.isFinite(rotation)) return 0;
+  const twoPi = Math.PI * 2;
+  const normalized = rotation % twoPi;
+  return normalized < 0 ? normalized + twoPi : normalized;
 }
 
 //  Lobby class 
@@ -108,6 +117,7 @@ export class Lobby {
       maxHealth: PLAYER_MAX_HEALTH,
       eliminatedBy: null,
       canBeRevived: false,
+      lastShotAtMs: Number.NEGATIVE_INFINITY,
     };
     this.players.set(id, player);
     return player;
@@ -116,12 +126,7 @@ export class Lobby {
   removePlayer(id: string): void {
     const leaving = this.players.get(id);
 
-    // Revive anyone this player had killed before removing them
-    this.players.forEach((p) => {
-      if (p.eliminatedBy === id && p.canBeRevived && p.health <= 0) {
-        this.revivePlayer(p, id);
-      }
-    });
+    this.grantRevivesForKiller(id);
 
     if (leaving) this.freeSlot(leaving.slot);
     this.players.delete(id);
@@ -194,6 +199,7 @@ export class Lobby {
       p.maxHealth = PLAYER_MAX_HEALTH;
       p.eliminatedBy = null;
       p.canBeRevived = false;
+      p.lastShotAtMs = Number.NEGATIVE_INFINITY;
       idx++;
     });
 
@@ -212,8 +218,6 @@ export class Lobby {
 
   private tick(): void {
     const dt = SERVER_TICK_MS / 1000;
-    const toRemove: number[] = [];
-    const hits: { bullet: ServerBullet; target: ServerPlayer }[] = [];
 
     // Apply movement — server is authoritative. Key bits: 0=Up, 1=Down, 2=Left, 3=Right.
     // Diagonals are normalised so they don't move √2× faster than orthogonals.
@@ -230,90 +234,117 @@ export class Lobby {
       p.y = Math.max(PLAYER_SIDE, Math.min(CANVAS_HEIGHT - PLAYER_SIDE, ny));
     });
 
-    // Move bullets & detect collisions
+    // Move bullets only. Collision, health, elimination, and active/inactive
+    // bullet state are reported by clients in this refactor stage.
     this.bullets.forEach((b) => {
+      b.prevX = b.x;
+      b.prevY = b.y;
       b.x += Math.cos(b.rotation) * BULLET_SPEED * dt;
       b.y += Math.sin(b.rotation) * BULLET_SPEED * dt;
-
-      const dx = b.x - b.startX;
-      const dy = b.y - b.startY;
-      if (
-        b.x < 0 || b.x > CANVAS_WIDTH ||
-        b.y < 0 || b.y > CANVAS_HEIGHT ||
-        Math.hypot(dx, dy) > BULLET_MAX_DISTANCE
-      ) {
-        toRemove.push(b.id);
-        return;
-      }
-
-      this.players.forEach((p) => {
-        if (p.id === b.ownerId || p.health <= 0) return;
-        const [v0, v1, v2] = getPlayerHitTriangle(p.x, p.y, p.rotation);
-        if (circleTouchesTriangle(b.x, b.y, BULLET_RADIUS, v0, v1, v2)) {
-          toRemove.push(b.id);
-          hits.push({ bullet: b, target: p });
-        }
-      });
     });
-
-    // Process hits
-    const newlyDead: string[] = [];
-    for (const { bullet, target } of hits) {
-      target.health--;
-
-      this.emit('player-hit', { targetSlot: target.slot, health: target.health, lobbyId: this.id });
-
-      if (target.health <= 0) {
-        target.eliminatedBy = bullet.ownerId;
-        target.canBeRevived = true;
-        this.emit('player-eliminated', {
-          targetSlot: target.slot,
-          killerSlot: bullet.ownerSlot,
-          lobbyId: this.id,
-        });
-        newlyDead.push(target.id);
-      }
-    }
-
-    // Revival chain: if a killer just died, their victims come back
-    for (const deadId of newlyDead) {
-      this.players.forEach((p) => {
-        if (p.eliminatedBy === deadId && p.canBeRevived && p.health <= 0) {
-          this.revivePlayer(p, deadId);
-        }
-      });
-    }
-
-    for (const id of toRemove) this.bullets.delete(id);
 
     this.broadcastState();
     this.checkWin();
   }
 
+  //  Player input
+
+  setPlayerInput(playerId: string, keys: number, rotation: number): void {
+    const player = this.players.get(playerId);
+    if (!player || player.health <= 0 || this.status !== 'playing') return;
+
+    player.inputKeys = keys & 0x0F;
+    player.rotation = normalizeRotation(rotation);
+  }
+
   //  Bullets 
 
-  addBullet(data: { x: number; y: number; rotation: number; ownerId: string }): void {
-    const owner = this.players.get(data.ownerId);
-    if (!owner) return;
+  tryShoot(ownerId: string, rotation: number): boolean {
+    const owner = this.players.get(ownerId);
+    if (!owner || owner.health <= 0 || this.status !== 'playing') return false;
+
+    const now = Date.now();
+    if (now - owner.lastShotAtMs < RELOAD_TIME) return false;
+
+    const shotRotation = normalizeRotation(rotation);
+    owner.rotation = shotRotation;
+    owner.lastShotAtMs = now;
+
+    const x = owner.x + Math.cos(shotRotation) * (PLAYER_SIDE + BULLET_RADIUS);
+    const y = owner.y + Math.sin(shotRotation) * (PLAYER_SIDE + BULLET_RADIUS);
     const id = this.nextBulletId;
     this.nextBulletId = (this.nextBulletId + 1) & 0xFFFF;
+
     this.bullets.set(id, {
       id,
-      ownerId: data.ownerId,
+      ownerId,
       ownerSlot: owner.slot,
-      x: data.x,
-      y: data.y,
-      rotation: data.rotation,
-      startX: data.x,
-      startY: data.y,
+      x,
+      y,
+      prevX: x,
+      prevY: y,
+      rotation: shotRotation,
+      startX: x,
+      startY: y,
     });
+
+    return true;
+  }
+
+  deactivateOwnedBullet(ownerId: string, bulletId: number): void {
+    if (!Number.isFinite(bulletId)) return;
+
+    const id = Math.trunc(bulletId) & 0xFFFF;
+    const bullet = this.bullets.get(id);
+    if (!bullet || bullet.ownerId !== ownerId) return;
+
+    this.bullets.delete(id);
+  }
+
+  applySelfHit(
+    playerId: string,
+    data: { bulletId: number; health: number; isEliminated: boolean },
+  ): void {
+    if (this.status !== 'playing') return;
+
+    const target = this.players.get(playerId);
+    if (!target || target.health <= 0) return;
+
+    if (!Number.isFinite(data.bulletId) || !Number.isFinite(data.health)) return;
+    const bulletId = Math.trunc(data.bulletId) & 0xFFFF;
+    const bullet = this.bullets.get(bulletId);
+    if (!bullet || bullet.ownerId === playerId) return;
+
+    this.bullets.delete(bulletId);
+
+    const reportedHealth = Math.max(0, Math.min(target.maxHealth, Math.floor(data.health)));
+    const isEliminated = data.isEliminated || reportedHealth <= 0;
+
+    target.health = isEliminated ? 0 : reportedHealth;
+    this.emit('player-hit', { targetSlot: target.slot, health: target.health, lobbyId: this.id });
+
+    if (isEliminated) {
+      target.inputKeys = 0;
+      target.eliminatedBy = bullet.ownerId;
+      target.canBeRevived = false;
+      this.emit('player-eliminated', {
+        targetSlot: target.slot,
+        killerSlot: bullet.ownerSlot,
+        lobbyId: this.id,
+      });
+      this.grantRevivesForKiller(target.id);
+    }
+
+    this.broadcastState();
+    this.checkWin();
   }
 
   //  Win condition 
 
   private checkWin(): void {
     const alive = [...this.players.values()].filter((p) => p.health > 0);
-    if (alive.length > 1) return;
+    const revivePending = [...this.players.values()].some((p) => p.health <= 0 && p.canBeRevived);
+    if (alive.length > 1 || revivePending) return;
 
     if (alive.length === 1) {
       this.winnerSlot = alive[0].slot;
@@ -326,7 +357,32 @@ export class Lobby {
 
   //  Revival 
 
-  private revivePlayer(player: ServerPlayer, killerId: string): void {
+  requestRevive(playerId: string): void {
+    const player = this.players.get(playerId);
+    if (!player || this.status !== 'playing' || player.health > 0 || !player.canBeRevived) return;
+
+    this.revivePlayer(player, player.eliminatedBy);
+    this.broadcastState();
+    this.checkWin();
+  }
+
+  private grantRevivesForKiller(killerId: string): void {
+    const killer = this.players.get(killerId);
+    const killerSlot = killer ? killer.slot : NO_SLOT;
+
+    this.players.forEach((p) => {
+      if (p.eliminatedBy === killerId && p.health <= 0 && !p.canBeRevived) {
+        p.canBeRevived = true;
+        this.emit('revive-available', {
+          slot: p.slot,
+          killerSlot,
+          lobbyId: this.id,
+        });
+      }
+    });
+  }
+
+  private revivePlayer(player: ServerPlayer, killerId: string | null): void {
     const pos = randomPosition();
     player.x = pos.x;
     player.y = pos.y;
@@ -335,7 +391,7 @@ export class Lobby {
     player.eliminatedBy = null;
     player.canBeRevived = false;
 
-    const killer = this.players.get(killerId);
+    const killer = killerId ? this.players.get(killerId) : undefined;
     this.emit('player-revived', {
       slot: player.slot,
       killerSlot: killer ? killer.slot : NO_SLOT,
@@ -356,6 +412,7 @@ export class Lobby {
       p.maxHealth = PLAYER_MAX_HEALTH;
       p.eliminatedBy = null;
       p.canBeRevived = false;
+      p.lastShotAtMs = Number.NEGATIVE_INFINITY;
     });
 
     this.clearGameLoop();
@@ -381,8 +438,12 @@ export class Lobby {
     const bullets: BulletDTO[] = [...this.bullets.values()].map((b) => ({
       id: b.id,
       ownerSlot: b.ownerSlot,
+      prevX: b.prevX,
+      prevY: b.prevY,
       x: b.x,
       y: b.y,
+      startX: b.startX,
+      startY: b.startY,
       rotation: b.rotation,
     }));
 
