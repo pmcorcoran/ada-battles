@@ -11,6 +11,7 @@
 import type { Scene } from '../../engine/GameLoop';
 import { InputManager } from '../../engine/InputManager';
 import { NetworkClient } from '../../network/NetworkClient';
+import type { WalletSession } from '../../wallet/walletAuth';
 import { PlayerComponent, BulletComponent } from '../components';
 import {
   drawBackground,
@@ -33,6 +34,8 @@ import {
 } from '../../../shared/constants';
 import { circleTouchesTriangle, getPlayerHitTriangle } from '../../../shared/collision';
 
+
+
 interface ClientPlayerCombatState {
   health: number;
   isEliminated: boolean;
@@ -42,7 +45,7 @@ export class GameScene implements Scene {
   // ── Dependencies ────────────────────────────────────────────────────────
 
   private readonly input: InputManager;
-  private readonly net: NetworkClient;
+  private net!: NetworkClient;
   private readonly hud: HUDSystem;
   private readonly canvas: HTMLCanvasElement;
 
@@ -69,27 +72,39 @@ export class GameScene implements Scene {
   private menuHitAreas:  MenuHitAreas  | null = null;
   private lobbyHitAreas: LobbyHitAreas | null = null;
 
-  constructor(canvas: HTMLCanvasElement) {
-    this.canvas = canvas;
-    this.input  = new InputManager(canvas);
-    this.net    = new NetworkClient();
-    this.hud    = new HUDSystem();
+  constructor(canvas: HTMLCanvasElement, private readonly wallet: WalletSession) {
+  this.canvas = canvas;
+  this.input  = new InputManager(canvas);
+  this.hud    = new HUDSystem();
 
-    this.bindNetworkEvents();
-    this.bindCanvasClick();
-    this.bindBackToMenu();
-    this.checkSpectateMode();
-  }
+  // NetworkClient is built on demand — match() in handleMenuClick,
+  // spectate() invoked by main.ts via startSpectate(). bindNetworkEvents()
+  // runs after the factory resolves so the listeners attach to the
+  // right socket.
 
-  private checkSpectateMode(): void {
-    const params = new URLSearchParams(window.location.search);
-    const spectateLobby = params.get('spectate');
-    if (spectateLobby) {
-      this.isSpectator = true;
-      this.status = 'lobby';
-      this.net.joinSpectate(spectateLobby);
-    }
-  }
+  this.bindCanvasClick();
+  this.bindBackToMenu();
+}
+
+/**
+ * Enter spectator mode for an existing lobby. Called by main.ts when
+ * the page was loaded with a `?spectate=<id>` query parameter, after
+ * the wallet has been connected.
+ */
+startSpectate(spectateLobby: string): void {
+  this.isSpectator = true;
+  this.status = 'lobby';
+  NetworkClient.spectate(spectateLobby, this.wallet)
+    .then((net) => {
+      this.net = net;
+      this.bindNetworkEvents();
+    })
+    .catch((err) => {
+      console.error('Spectate failed:', err);
+      this.status = 'menu';
+      this.isSpectator = false;
+    });
+}
 
   // ── Network wiring ────────────────────────────────────────────────────
 
@@ -279,12 +294,12 @@ export class GameScene implements Scene {
     }
 
     if (this.status === 'lobby') {
-      this.lobbyHitAreas = drawLobby(ctx, this.maxPlayers, this.players.size, this.net.lobbyId);
+      this.lobbyHitAreas = drawLobby(ctx, this.maxPlayers, this.players.size, this.net?.lobbyId ?? '');    
     }
 
     // Draw entities
     this.players.forEach((p) => {
-      if (p.isAlive) drawPlayer(ctx, p, p.slot === this.net.localSlot, this.input.mouse);
+      if (p.isAlive) drawPlayer(ctx, p, p.slot === this.net?.localSlot, this.input.mouse);
     });
 
     this.bullets.forEach((b) => drawBullet(ctx, b));
@@ -413,7 +428,17 @@ export class GameScene implements Scene {
     if (x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h) {
       this.status = 'lobby';
       this.refreshPlayerCount();
-      this.net.joinLobby(this.maxPlayers);
+
+      NetworkClient.match(this.maxPlayers, this.wallet)
+        .then((net) => {
+          this.net = net;
+          this.bindNetworkEvents();
+        })
+        .catch((err) => {
+          console.error('Matchmaking failed:', err);
+          this.status = 'menu';
+          this.refreshPlayerCount();
+        });
     }
   }
 
