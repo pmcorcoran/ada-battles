@@ -22,7 +22,7 @@ runner container.
 ```
 ┌──────────┐  POST /api/lobbies/match   ┌────────────────┐
 │ Browser  │ ─────────────────────────► │  Matchmaker    │
-│ (Phaser) │ ◄──── { wsUrl, challenge } │  :8080         │
+│          │ ◄──── { wsUrl, challenge } │  :8080         │
 └────┬─────┘                            └───────┬────────┘
      │                                          │ dockerode
      │  WS /lobby/<id>?address=&challenge=&sig= │
