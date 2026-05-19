@@ -93,21 +93,19 @@ export class Matchmaker {
 
   /** Reap ended, empty, or never-came-up lobbies. Idempotent. */
   async reap(): Promise<void> {
-    const now = Date.now();
-    for (const record of this.lobbies.values()) {
-      const ageMs = now - record.createdAt;
-      const dead =
-        record.status === 'ended' ||
-        (record.playerCount === 0 && ageMs > 60_000) ||
-        (record.status === 'starting' && ageMs > 60_000);
-
-      if (dead) {
-        console.log(`[reap] ${record.id} status=${record.status} players=${record.playerCount} age=${Math.round(ageMs / 1000)}s`);
-        await this.orchestrator.stop(record.containerRef).catch(() => {});
-        this.lobbies.delete(record.id);
+      const now = Date.now();
+      for (const record of this.lobbies.values()) {
+        const ageMs = now - record.createdAt;
+        const dead =
+          record.status === 'ended' ||
+          (record.status === 'starting' && ageMs > 60_000);
+ 
+        if (dead) {
+          await this.orchestrator.stop(record.containerRef).catch(() => {});
+          this.lobbies.delete(record.id);
+        }
       }
     }
-  }
 }
 
 function sleep(ms: number): Promise<void> {

@@ -141,10 +141,6 @@ hub.on('connection', (socket) => {
     }
   });
 
-  socket.on('request-restart', () => {
-    if (lobby.status === 'ended') lobby.reset();
-  });
-
 
   // TODO: these payload types duplicate ClientToServerEvents in shared/types.ts.
   // Removed once the WebSocketHub.on() overload resolution is fixed — contextual

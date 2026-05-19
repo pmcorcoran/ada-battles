@@ -90,6 +90,7 @@ export class Lobby {
 
   private slotBitset = 0;
   private nextBulletId = 0;
+  private hasHadPlayers = false;
   private countdownTime = COUNTDOWN_SECONDS;
   private countdownInterval: NodeJS.Timeout | null = null;
   private gameLoopInterval:  NodeJS.Timeout | null = null;
@@ -120,6 +121,7 @@ export class Lobby {
       lastShotAtMs: Number.NEGATIVE_INFINITY,
     };
     this.players.set(id, player);
+    this.hasHadPlayers = true;
     return player;
   }
 
@@ -131,16 +133,16 @@ export class Lobby {
     if (leaving) this.freeSlot(leaving.slot);
     this.players.delete(id);
 
-    if (this.status === 'playing' || this.status === 'countdown') {
-      if (this.players.size < 2) {
-        this.reset();
-      } else {
-        this.checkWin();
-      }
-    }
-
-    if (this.status === 'lobby' && this.players.size >= this.maxPlayers) {
-      this.startCountdown();
+    // State transitions on player leave:
+    //   playing   → ended  (always; matches are one-shot)
+    //   countdown → lobby  (cancel and wait for more players)
+    //   lobby     → ended  (if we've had players and now empty)
+    if (this.status === 'playing') {
+      this.endMatch();
+    } else if (this.status === 'countdown') {
+      this.cancelCountdown();
+    } else if (this.status === 'lobby' && this.players.size === 0 && this.hasHadPlayers) {
+      this.endMatch();
     }
   }
 
@@ -181,6 +183,23 @@ export class Lobby {
         this.startGame();
       }
     }, 1000);
+  }
+
+  /** Cancel an in-progress countdown and return to lobby state. */
+  private cancelCountdown(): void {
+    this.clearCountdown();
+    this.countdownTime = COUNTDOWN_SECONDS;
+    this.status = 'lobby';
+    this.broadcastState();
+  }
+
+  /** End the match. Terminal — the runner will see this via /status
+   *  and the matchmaker will reap. */
+  private endMatch(): void {
+    this.status = 'ended';
+    this.clearGameLoop();
+    this.clearCountdown();
+    this.broadcastState();
   }
 
   //  Game start 
@@ -350,9 +369,8 @@ export class Lobby {
       this.winnerSlot = alive[0].slot;
       this.emit('game-over', { winnerSlot: this.winnerSlot, lobbyId: this.id });
     }
-
-    this.status = 'ended';
-    this.clearGameLoop();
+ 
+    this.endMatch();
   }
 
   //  Revival 
@@ -397,30 +415,7 @@ export class Lobby {
       killerSlot: killer ? killer.slot : NO_SLOT,
       lobbyId: this.id,
     });
-  }
-
-  //  Reset 
-
-  reset(): void {
-    this.status = 'lobby';
-    this.winnerSlot = null;
-    this.bullets.clear();
-
-    this.players.forEach((p) => {
-      p.inputKeys = 0;
-      p.health = PLAYER_MAX_HEALTH;
-      p.maxHealth = PLAYER_MAX_HEALTH;
-      p.eliminatedBy = null;
-      p.canBeRevived = false;
-      p.lastShotAtMs = Number.NEGATIVE_INFINITY;
-    });
-
-    this.clearGameLoop();
-    this.clearCountdown();
-
-    this.emit('lobby-reset', { lobbyId: this.id });
-    this.broadcastState();
-  }
+  } 
 
   //  Broadcasting 
 
