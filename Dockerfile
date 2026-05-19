@@ -4,34 +4,45 @@
 # bundle. The image we ship at the end carries only the compiled output
 # and production deps — no TS toolchain, no source.
 #
+# Post-refactor layout: backend/, frontend/, and shared/ are siblings
+# at the repo root. Build context is the repo root (see compose).
+#
 FROM node:20-alpine AS build
 
 WORKDIR /app
 
-# Install build deps first so layer caching kicks in when only source
-# changes. `frontend/` is the existing project root in the repo; the
-# matchmaker.ts and runner.ts files live alongside it after the split.
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci
+# Install backend and frontend deps separately. Layer caching: package
+# manifests change rarely; source changes constantly. Copy manifests
+# first, install, then copy source.
+COPY backend/package.json backend/package-lock.json* ./backend/
+COPY frontend/package.json frontend/package-lock.json* ./frontend/
 
-# Source. The build needs everything under frontend/src plus the new
-# entrypoints. `tsconfig.json` already covers all of these.
-COPY frontend/tsconfig.json ./
-COPY frontend/src ./src
-COPY frontend/public ./public
+RUN cd backend  && npm ci
+RUN cd frontend && npm ci
 
-# Build server (TSC → dist/) and client bundle (esbuild → public/bundle.js).
-RUN npm run build
+# Source. shared/ is consumed by both sides via the @shared/* path
+# alias in each tsconfig.
+COPY shared/   ./shared/
+COPY backend/  ./backend/
+COPY frontend/ ./frontend/
+
+# Build server (TSC → backend/dist/) and client bundle
+# (esbuild → frontend/public/bundle.js).
+RUN cd backend  && npm run build
+RUN cd frontend && npm run build
 
 # Prune dev deps so the runtime layer copies a slim node_modules.
-RUN npm prune --omit=dev
+# Only the backend's node_modules ships — the frontend's deps are
+# bundled into the client bundle by esbuild and don't need to exist
+# at runtime.
+RUN cd backend && npm prune --omit=dev
 
 
 # ── Runtime stage ──────────────────────────────────────────────────
 #
 # Same image is used for the matchmaker AND the lobby-runner. The
-# difference is purely the Cmd: matchmaker.js or runner.js. This keeps
-# CI simple — one build, one image, two roles.
+# difference is purely the Cmd: matchmaker/index.js or runner.js. This
+# keeps CI simple — one build, one image, two roles.
 #
 FROM node:20-alpine AS runtime
 
@@ -48,9 +59,15 @@ RUN apk add --no-cache dumb-init && \
 WORKDIR /app
 
 # Compiled JS, production deps, and the static client bundle.
-COPY --from=build --chown=app:app /app/node_modules ./node_modules
-COPY --from=build --chown=app:app /app/dist         ./dist
-COPY --from=build --chown=app:app /app/public       ./public
+#
+# Note on the dist/ path: because backend/tsconfig.json includes
+# files from ../shared, tsc emits with rootDir set to the repo root,
+# producing dist/backend/src/... and dist/shared/.... The CMD below
+# reflects that. If you ever flatten this, the spawn override in
+# DockerOrchestrator must change in lockstep.
+COPY --from=build --chown=app:app /app/backend/node_modules    ./node_modules
+COPY --from=build --chown=app:app /app/backend/dist            ./dist
+COPY --from=build --chown=app:app /app/frontend/public         ./public
 
 # Either service listens on $PORT; matchmaker defaults to 8080, runner
 # to 3000, but both honour the env var. We don't EXPOSE here — the
@@ -64,5 +81,5 @@ USER app
 ENTRYPOINT ["dumb-init", "--"]
 
 # Default is the matchmaker; runner containers override Cmd at spawn
-# time (see DockerOrchestrator.spawn in matchmaker.ts).
-CMD ["node", "dist/server/matchmaker.js"]
+# time (see DockerOrchestrator.spawn in backend/src/matchmaker/orchestrator/).
+CMD ["node", "dist/backend/src/matchmaker/index.js"]

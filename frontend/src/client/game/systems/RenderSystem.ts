@@ -13,7 +13,7 @@ import {
   BULLET_RADIUS,
   COLORS,
   LOBBY_SIZES,
-} from '../../../shared/constants';
+} from '../../../../../shared/constants';
 import type { PlayerComponent } from '../components/PlayerComponent';
 import type { BulletComponent } from '../components/BulletComponent';
 import type { MouseState } from '../../engine/InputManager';

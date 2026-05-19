@@ -5,7 +5,7 @@
  * on the client. Hydrated from PlayerDTO received over the network.
  */
 
-import type { PlayerDTO } from '../../../shared/types';
+import type { PlayerDTO } from '../../../../../shared/types';
 
 export class PlayerComponent {
   slot: number;

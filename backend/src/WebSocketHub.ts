@@ -14,7 +14,7 @@ import { randomUUID } from 'crypto';
 import type { Server as HttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
-import { encode as wireEncode, decode as wireDecode } from '../shared/wire';
+import { encode as wireEncode, decode as wireDecode } from '../../shared/wire';
 
 type SingleArg<F> = F extends (arg: infer A) => any ? A : never;
 type Fn<F> = F extends (...args: any[]) => any ? F : never;
@@ -122,8 +122,8 @@ export class HubSocket<C2S, S2C> {
     public readonly url: string,
   ) {}
 
-  on<K extends keyof C2S & string>(event: K, handler: Fn<C2S[K]>): void;
   on(event: 'disconnect', handler: () => void): void;
+  on<K extends keyof C2S & string>(event: K, handler: Fn<C2S[K]>): void;
   on(event: string, handler: (data: any) => void): void {
     let arr = this.listeners.get(event);
     if (!arr) {

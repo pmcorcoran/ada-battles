@@ -5,7 +5,7 @@
  * Hydrated from BulletDTO each tick.
  */
 
-import type { BulletDTO } from '../../../shared/types';
+import type { BulletDTO } from '../../../../../shared/types';
 
 export class BulletComponent {
   id: number;

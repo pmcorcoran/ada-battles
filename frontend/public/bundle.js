@@ -99,10 +99,10 @@
     }
   };
 
-  // src/shared/types.ts
+  // ../shared/types.ts
   var NO_SLOT = 255;
 
-  // src/shared/wire.ts
+  // ../shared/wire.ts
   var OP = {
     "player-id": 1,
     "joined-matched-lobby": 2,
@@ -142,8 +142,10 @@
   var enc = new TextEncoder();
   var dec = new TextDecoder();
   var Writer = class {
+    buf;
+    view;
+    pos = 0;
     constructor(size) {
-      this.pos = 0;
       this.buf = new Uint8Array(size);
       this.view = new DataView(this.buf.buffer);
     }
@@ -187,8 +189,10 @@
     }
   };
   var Reader = class {
+    buf;
+    view;
+    pos = 0;
     constructor(input) {
-      this.pos = 0;
       if (input instanceof Uint8Array) {
         this.buf = input;
         this.view = new DataView(input.buffer, input.byteOffset, input.byteLength);
@@ -434,9 +438,38 @@
     }
   }
 
+  // src/client/wallet/cip30.ts
+  function getInstalledWallets() {
+    const cardano = window.cardano;
+    if (!cardano) return [];
+    return Object.keys(cardano).filter((id) => cardano[id]?.apiVersion && cardano[id]?.enable).map((id) => ({ id, info: cardano[id] }));
+  }
+  function hexEncode(s) {
+    return Array.from(new TextEncoder().encode(s)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // src/client/wallet/walletAuth.ts
+  async function connectWallet(walletMeta) {
+    const api = await walletMeta.enable();
+    const addressHex = await api.getChangeAddress();
+    sessionStorage.setItem("walletAddress", addressHex);
+    return { api, addressHex };
+  }
+  async function signChallenge(session, challenge) {
+    const sig = await session.api.signData(session.addressHex, hexEncode(challenge));
+    return sig;
+  }
+
   // src/client/network/NetworkClient.ts
-  var NetworkClient = class {
-    constructor() {
+  var MATCHMAKER_URL = window.MATCHMAKER_URL ?? location.origin;
+  var NetworkClient = class _NetworkClient {
+    /**
+     * Direct constructor. Prefer `match()` or `spectate()` — those
+     * resolve the URL through the matchmaker first. This is exposed
+     * mainly for tests and for advanced use cases that already know
+     * the runner URL.
+     */
+    constructor(wsUrl) {
       this.listeners = /* @__PURE__ */ new Map();
       this.outbox = [];
       this.open = false;
@@ -444,8 +477,7 @@
       this.localSlot = -1;
       /** The lobby room we've been assigned to. */
       this.lobbyId = "";
-      const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      this.ws = new WebSocket(`${proto}//${location.host}/`);
+      this.ws = new WebSocket(wsUrl);
       this.ws.binaryType = "arraybuffer";
       this.ws.addEventListener("open", () => {
         this.open = true;
@@ -457,17 +489,45 @@
         const msg = decode(new Uint8Array(ev.data));
         if (!msg) return;
         const arr = this.listeners.get(msg.event);
+        console.log("[net] recv", msg.event, "handlers:", arr?.length ?? 0);
         if (!arr) return;
         for (const h of arr) h(msg.data);
       });
     }
+    static async match(maxPlayers, wallet) {
+      const res = await fetch(`${MATCHMAKER_URL}/api/lobbies/match`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ maxPlayers })
+      });
+      if (!res.ok) throw new Error(`matchmaker rejected: ${res.status}`);
+      const { lobbyId, wsUrl, challenge } = await res.json();
+      const signature = await signChallenge(wallet, challenge);
+      const params = new URLSearchParams({
+        address: wallet.addressHex,
+        challenge,
+        sig: JSON.stringify(signature)
+      });
+      const authedUrl = `${wsUrl}?${params.toString()}`;
+      const net = new _NetworkClient(authedUrl);
+      net.lobbyId = lobbyId;
+      return net;
+    }
+    static async spectate(lobbyId, wallet) {
+      const res = await fetch(`${MATCHMAKER_URL}/api/lobbies/${encodeURIComponent(lobbyId)}`);
+      if (!res.ok) throw new Error(`lobby not found: ${res.status}`);
+      const { wsUrl, challenge } = await res.json();
+      const signature = await signChallenge(wallet, challenge);
+      const params = new URLSearchParams({
+        address: wallet.addressHex,
+        challenge,
+        sig: JSON.stringify(signature)
+      });
+      const net = new _NetworkClient(`${wsUrl}?${params.toString()}`);
+      net.lobbyId = lobbyId;
+      return net;
+    }
     //  Outbound 
-    joinLobby(size) {
-      this.send("join-lobby", size);
-    }
-    joinSpectate(lobbyId) {
-      this.send("join-spectate", lobbyId);
-    }
     requestStart() {
       this.send("request-start", void 0);
     }
@@ -564,7 +624,7 @@
     }
   };
 
-  // src/shared/constants.ts
+  // ../shared/constants.ts
   var CANVAS_WIDTH = 900;
   var CANVAS_HEIGHT = 630;
   var PLAYER_BASE = 18;
@@ -773,7 +833,7 @@
     }
   };
 
-  // src/shared/collision.ts
+  // ../shared/collision.ts
   function getPlayerTriangle(px, py, rotation) {
     const cos = Math.cos(rotation);
     const sin = Math.sin(rotation);
@@ -831,7 +891,8 @@
 
   // src/client/game/scenes/GameScene.ts
   var GameScene = class {
-    constructor(canvas2) {
+    constructor(canvas2, wallet) {
+      this.wallet = wallet;
       // ── Entity stores ───────────────────────────────────────────────────────
       this.players = /* @__PURE__ */ new Map();
       this.bullets = /* @__PURE__ */ new Map();
@@ -851,21 +912,26 @@
       this.lobbyHitAreas = null;
       this.canvas = canvas2;
       this.input = new InputManager(canvas2);
-      this.net = new NetworkClient();
       this.hud = new HUDSystem();
-      this.bindNetworkEvents();
       this.bindCanvasClick();
       this.bindBackToMenu();
-      this.checkSpectateMode();
     }
-    checkSpectateMode() {
-      const params = new URLSearchParams(window.location.search);
-      const spectateLobby = params.get("spectate");
-      if (spectateLobby) {
-        this.isSpectator = true;
-        this.status = "lobby";
-        this.net.joinSpectate(spectateLobby);
-      }
+    /**
+     * Enter spectator mode for an existing lobby. Called by main.ts when
+     * the page was loaded with a `?spectate=<id>` query parameter, after
+     * the wallet has been connected.
+     */
+    startSpectate(spectateLobby) {
+      this.isSpectator = true;
+      this.status = "lobby";
+      NetworkClient.spectate(spectateLobby, this.wallet).then((net) => {
+        this.net = net;
+        this.bindNetworkEvents();
+      }).catch((err) => {
+        console.error("Spectate failed:", err);
+        this.status = "menu";
+        this.isSpectator = false;
+      });
     }
     // ── Network wiring ────────────────────────────────────────────────────
     bindNetworkEvents() {
@@ -1015,10 +1081,10 @@
         return;
       }
       if (this.status === "lobby") {
-        this.lobbyHitAreas = drawLobby(ctx, this.maxPlayers, this.players.size, this.net.lobbyId);
+        this.lobbyHitAreas = drawLobby(ctx, this.maxPlayers, this.players.size, this.net?.lobbyId ?? "");
       }
       this.players.forEach((p) => {
-        if (p.isAlive) drawPlayer(ctx, p, p.slot === this.net.localSlot, this.input.mouse);
+        if (p.isAlive) drawPlayer(ctx, p, p.slot === this.net?.localSlot, this.input.mouse);
       });
       this.bullets.forEach((b) => drawBullet(ctx, b));
       if (this.status === "countdown") {
@@ -1115,7 +1181,14 @@
       if (x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h) {
         this.status = "lobby";
         this.refreshPlayerCount();
-        this.net.joinLobby(this.maxPlayers);
+        NetworkClient.match(this.maxPlayers, this.wallet).then((net) => {
+          this.net = net;
+          this.bindNetworkEvents();
+        }).catch((err) => {
+          console.error("Matchmaking failed:", err);
+          this.status = "menu";
+          this.refreshPlayerCount();
+        });
       }
     }
     handleLobbyClick(x, y) {
@@ -1164,38 +1237,6 @@
     }
   };
 
-  // src/client/wallet/cip30.ts
-  function getInstalledWallets() {
-    const cardano = window.cardano;
-    if (!cardano) return [];
-    return Object.keys(cardano).filter((id) => cardano[id]?.apiVersion && cardano[id]?.enable).map((id) => ({ id, info: cardano[id] }));
-  }
-  function hexEncode(s) {
-    return Array.from(new TextEncoder().encode(s)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  // src/client/wallet/walletAuth.ts
-  async function authenticateWithWallet(walletMeta) {
-    const api = await walletMeta.enable();
-    const addressHex = await api.getChangeAddress();
-    const nonceRes = await fetch(
-      `/api/auth/nonce?address=${encodeURIComponent(addressHex)}`
-    );
-    if (!nonceRes.ok) throw new Error("Server refused nonce request");
-    const { nonce } = await nonceRes.json();
-    const signature = await api.signData(addressHex, hexEncode(nonce));
-    const verifyRes = await fetch("/api/auth/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ address: addressHex, signature })
-    });
-    if (!verifyRes.ok) throw new Error("Signature verification failed");
-    const { token } = await verifyRes.json();
-    sessionStorage.setItem("authToken", token);
-    sessionStorage.setItem("walletAddress", addressHex);
-    return { api, addressHex, token };
-  }
-
   // src/client/wallet/walletUI.ts
   function initWalletUI(els, onConnected) {
     let connected = false;
@@ -1220,7 +1261,7 @@
     async function attemptConnect(_id, info) {
       els.walletList.style.display = "none";
       try {
-        const result = await authenticateWithWallet(info);
+        const result = await connectWallet(info);
         connected = true;
         els.connectBtn.textContent = "Connected";
         els.connectBtn.disabled = true;
@@ -1246,13 +1287,15 @@
       walletList: document.getElementById("walletList"),
       walletInfo: document.getElementById("walletInfo")
     },
-    () => {
+    (session) => {
       canvas.style.filter = "";
       canvas.style.pointerEvents = "";
       const loop = new GameLoop(canvas);
-      const scene = new GameScene(canvas);
+      const scene = new GameScene(canvas, session);
       loop.setScene(scene);
       loop.start();
+      const spectateLobby = new URLSearchParams(location.search).get("spectate");
+      if (spectateLobby) scene.startSpectate(spectateLobby);
     }
   );
 })();

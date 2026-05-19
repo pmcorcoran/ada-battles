@@ -9,16 +9,17 @@
 # Browser clients connect to:
 #   POST http://localhost:8080/api/lobbies/match  →  { wsUrl: "ws://localhost:8080/lobby/<id>" }
 #
-# (The matchmaker rewrites internal `ws://runner-<id>:3000` to a public
-# URL; for local dev we tunnel through the matchmaker via a websocket
-# proxy — see the proxy note at the bottom. Simpler alternative for dev
-# is to publish each runner on its own host port; we don't do that here
-# because the port-rewriting logic would clutter the matchmaker code.)
+# The matchmaker reverse-proxies WS upgrades on /lobby/<id> through to
+# the corresponding runner-<id> container via http-proxy. See
+# backend/src/matchmaker/wsProxy.ts.
 
 services:
   matchmaker:
     image: ada-battles:latest
     build:
+      # Context is the repo root so the Dockerfile can see backend/,
+      # frontend/, and shared/ as siblings. Pre-refactor this was
+      # ./frontend; if you have stale build caches, prune them.
       context: .
       dockerfile: Dockerfile
       args:
@@ -58,12 +59,11 @@ networks:
 # network. Compose owns the matchmaker; the matchmaker owns the runners.
 #
 # Reaching runners from the browser:
-# In dev, the simplest workable approach is to run a tiny WS-proxying
-# reverse proxy in the matchmaker itself, routing `ws://localhost:8080/lobby/<id>`
-# to `ws://runner-<id>:3000`. That's ~30 lines with `http-proxy` and is
-# left as an exercise — see the `publicUrlFor` hook in matchmaker.ts.
-# Production deployments would use an ingress (nginx, Traefik, k8s
-# Ingress) doing the same path-based routing.
+# The matchmaker runs a WS-proxying reverse proxy that routes
+# `ws://localhost:8080/lobby/<id>` to `ws://runner-<id>:3000`. See
+# backend/src/matchmaker/wsProxy.ts. Production deployments would use
+# an ingress (nginx, Traefik, k8s Ingress) doing the same path-based
+# routing.
 #
 # Cleaning up dangling runners after a crash:
 #   docker ps --filter "label=ada-battles.role=lobby-runner" -q | xargs -r docker rm -f

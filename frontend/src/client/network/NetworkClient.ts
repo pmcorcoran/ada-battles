@@ -10,8 +10,8 @@
 import type {
   ServerToClientEvents,
   ClientToServerEvents,
-} from '../../shared/types';
-import { encode as wireEncode, decode as wireDecode } from '../../shared/wire';
+} from '../../../../shared/types';
+import { encode as wireEncode, decode as wireDecode } from '../../../../shared/wire';
 import type { WalletSession } from '../wallet/walletAuth';
 import { signChallenge } from '../wallet/walletAuth';
 

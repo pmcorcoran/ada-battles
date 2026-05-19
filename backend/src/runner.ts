@@ -22,14 +22,10 @@ import http from 'http';
 import type {
   ServerToClientEvents,
   ClientToServerEvents,
-} from '../shared/types';
+} from '../../shared/types';
 import { Lobby, type ServerPlayer } from './Lobby';
 import { WebSocketHub } from './WebSocketHub';
-import { AuthService } from './auth/authService';
-import { createAuthRouter } from './auth/authRoutes';
-import { verifyChallenge } from '../shared/authChallenge';
-import { bech32 } from 'bech32';
-import verifyDataSignature from '@cardano-foundation/cardano-verify-datasignature';
+import { verifyWalletChallenge } from './auth/walletChallenge';
 
 const AUTH_SECRET = required('AUTH_SECRET');
 
@@ -50,10 +46,8 @@ if (MAX_PLAYERS < 3 || MAX_PLAYERS > 5) {
 const app    = express();
 const server = http.createServer(app);
 const hub    = new WebSocketHub<ClientToServerEvents, ServerToClientEvents>(server);
-const auth   = new AuthService();
 
 app.use(express.json());
-app.use('/api/auth', createAuthRouter(auth));
 
 // ── The one Lobby this process owns ────────────────────────────────
 
@@ -109,10 +103,8 @@ function trackOccupancy(): void {
 // joining `LOBBY_ID` by connecting to this runner at all.
 
 hub.on('connection', (socket) => {
-  // The hub exposes the original upgrade URL on the socket; if your
-  // WebSocketHub doesn't, see the note below — it's a 3-line addition.
-  const auth = authenticate(socket.url);
-  if (!auth) {
+  const authResult = verifyWalletChallenge(socket.url, LOBBY_ID, AUTH_SECRET);
+  if (!authResult) {
     console.warn(`[${LOBBY_ID}] rejected unauthed connection`);
     socket.disconnect();
     return;
@@ -153,10 +145,14 @@ hub.on('connection', (socket) => {
     if (lobby.status === 'ended') lobby.reset();
   });
 
-  socket.on('player-input',     (data) => lobby.setPlayerInput(socket.id, data.keys, data.rotation));
-  socket.on('shoot',            (data) => lobby.tryShoot(socket.id, data.rotation));
-  socket.on('self-hit',         (data) => lobby.applySelfHit(socket.id, data));
-  socket.on('bullet-inactive',  (data) => lobby.deactivateOwnedBullet(socket.id, data.bulletId));
+
+  // TODO: these payload types duplicate ClientToServerEvents in shared/types.ts.
+  // Removed once the WebSocketHub.on() overload resolution is fixed — contextual
+  // typing currently drops through to the `any` overload here.
+  socket.on('player-input',     (data: { keys: number; rotation: number }) => lobby.setPlayerInput(socket.id, data.keys, data.rotation));
+  socket.on('shoot',            (data: { rotation: number })                => lobby.tryShoot(socket.id, data.rotation));
+  socket.on('self-hit',         (data: { bulletId: number; health: number; isEliminated: boolean }) => lobby.applySelfHit(socket.id, data));
+  socket.on('bullet-inactive',  (data: { bulletId: number })                => lobby.deactivateOwnedBullet(socket.id, data.bulletId));
   socket.on('request-revive',   ()     => lobby.requestRevive(socket.id));
 
   // ── Leave ──────────────────────────────────────────────────────
@@ -208,48 +204,4 @@ function parseIntStrict(s: string): number {
     process.exit(2);
   }
   return n;
-}
-
-
-function authenticate(socketUrl: string): { addressHex: string } | null {
-  let parsed: URL;
-  try {
-    parsed = new URL(socketUrl, 'http://placeholder');
-  } catch {
-    return null;
-  }
-  const address   = parsed.searchParams.get('address');
-  const challenge = parsed.searchParams.get('challenge');
-  const sigJson   = parsed.searchParams.get('sig');
-  if (!address || !challenge || !sigJson) return null;
-
-  // 1. Challenge must be a valid matchmaker-issued HMAC for this lobby.
-  const payload = verifyChallenge(challenge, LOBBY_ID, AUTH_SECRET);
-  if (!payload) return null;
-
-  // 2. Wallet signature must verify the challenge string under `address`.
-  let signature: { signature: string; key: string };
-  try {
-    signature = JSON.parse(sigJson);
-  } catch {
-    return null;
-  }
-  const addressBech32 = hexAddressToBech32(address);
-  const ok = verifyDataSignature(
-    signature.signature,
-    signature.key,
-    challenge,
-    addressBech32,
-  );
-  if (!ok) return null;
-
-  return { addressHex: address };
-}
-
-function hexAddressToBech32(hex: string): string {
-  const bytes = Buffer.from(hex, 'hex');
-  const networkId = bytes[0] & 0x0f;
-  const prefix = networkId === 1 ? 'addr' : 'addr_test';
-  const words = bech32.toWords(bytes);
-  return bech32.encode(prefix, words, 1000);
 }

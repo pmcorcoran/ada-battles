@@ -6,8 +6,8 @@
  */
 
 import type { WebSocketHub } from './WebSocketHub';
-import type { ServerToClientEvents, ClientToServerEvents, PlayerDTO, BulletDTO } from '../shared/types';
-import { NO_SLOT } from '../shared/types';
+import type { ServerToClientEvents, ClientToServerEvents, PlayerDTO, BulletDTO } from '../../shared/types';
+import { NO_SLOT } from '../../shared/types';
 import {
   CANVAS_WIDTH,
   CANVAS_HEIGHT,
@@ -19,8 +19,8 @@ import {
   RELOAD_TIME,
   SERVER_TICK_MS,
   COUNTDOWN_SECONDS,
-} from '../shared/constants';
-import type { LobbyStatus } from '../shared/types';
+} from '../../shared/constants';
+import type { LobbyStatus } from '../../shared/types';
 
 //  Internal entity types (never serialised directly) 
 

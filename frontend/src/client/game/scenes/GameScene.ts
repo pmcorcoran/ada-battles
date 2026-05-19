@@ -24,15 +24,15 @@ import {
   type LobbyHitAreas,
 } from '../systems/RenderSystem';
 import { HUDSystem } from '../systems/HUDSystem';
-import type { LobbyStateDTO, LobbyStatus } from '../../../shared/types';
+import type { LobbyStateDTO, LobbyStatus } from '../../../../../shared/types';
 import {
   BULLET_MAX_DISTANCE,
   BULLET_RADIUS,
   CANVAS_HEIGHT,
   CANVAS_WIDTH,
   RELOAD_TIME,
-} from '../../../shared/constants';
-import { circleTouchesTriangle, getPlayerHitTriangle } from '../../../shared/collision';
+} from '../../../../../shared/constants';
+import { circleTouchesTriangle, getPlayerHitTriangle } from '../../../../../shared/collision';
 
 
 
