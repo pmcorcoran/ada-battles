@@ -140,16 +140,12 @@ hub.on('connection', (socket) => {
       lobby.startCountdown();
     }
   });
-
-
-  // TODO: these payload types duplicate ClientToServerEvents in shared/types.ts.
-  // Removed once the WebSocketHub.on() overload resolution is fixed — contextual
-  // typing currently drops through to the `any` overload here.
-  socket.on('player-input',     (data: { keys: number; rotation: number }) => lobby.setPlayerInput(socket.id, data.keys, data.rotation));
-  socket.on('shoot',            (data: { rotation: number })                => lobby.tryShoot(socket.id, data.rotation));
-  socket.on('self-hit',         (data: { bulletId: number; health: number; isEliminated: boolean }) => lobby.applySelfHit(socket.id, data));
-  socket.on('bullet-inactive',  (data: { bulletId: number })                => lobby.deactivateOwnedBullet(socket.id, data.bulletId));
+  
   socket.on('request-revive',   ()     => lobby.requestRevive(socket.id));
+  socket.on('player-input',     (data) => lobby.setPlayerInput(socket.id, data.keys, data.rotation));
+  socket.on('shoot',            (data) => lobby.tryShoot(socket.id, data.rotation));
+  socket.on('self-hit',         (data) => lobby.applySelfHit(socket.id, data));
+  socket.on('bullet-inactive',  (data) => lobby.deactivateOwnedBullet(socket.id, data.bulletId));
 
   // ── Leave ──────────────────────────────────────────────────────
 

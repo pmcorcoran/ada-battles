@@ -447,11 +447,15 @@ runner's connection handler.
 - Warm-pool eviction policy. Currently empty runners live forever once spawned.
   No cap, no oldest-first reaping. Acceptable now since traffic is low; revisit
   if idle runners start consuming meaningful resources.
-- when a player disconnects during countdown, lubby correctly reverts from countdown to   waiting room lobby, but a remnant of the countdown clock still appears on canvas. Minor bug.
+- when a player disconnects during countdown, lubby correctly reverts from countdown to 
+  waiting room lobby, but a remnant of the countdown clock still appears on canvas. Minor bug.
 - Spectate flow: GET /api/lobbies/:id should issue a challenge the same way
   POST /api/lobbies/match does.
 - Deffering all spectate things in general.
 - `wire.check.ts` ships to dist; exclude from backend/tsconfig.json when convenient.
+- TS module resolution migration. `moduleResolution: "node"` is deprecated in
+  TS 7. Migrate to `"node16"` or `"nodenext"` — requires adding explicit `.js`
+  extensions to all relative imports in backend/ and shared/.
 
 ## Operational notes
 
