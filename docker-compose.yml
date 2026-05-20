@@ -1,17 +1,19 @@
 # Local dev orchestration.
 #
 # `docker compose up` boots just the matchmaker. It spawns lobby-runner
-# containers on demand via the host Docker socket. Both services share
+# containers on demand via the host Docker socket, AND a per-runner
+# hydra-node sidecar (one Hydra container per match). All three share
 # the `ada-battles-net` network so the matchmaker can reach runners by
-# container name and clients can reach runners through the matchmaker's
-# returned URL.
+# container name, runners can reach their sidecars by alias, and
+# clients can reach runners through the matchmaker's returned URL.
 #
 # Browser clients connect to:
 #   POST http://localhost:8080/api/lobbies/match  →  { wsUrl: "ws://localhost:8080/lobby/<id>" }
 #
 # The matchmaker reverse-proxies WS upgrades on /lobby/<id> through to
 # the corresponding runner-<id> container via http-proxy. See
-# backend/src/matchmaker/wsProxy.ts.
+# backend/src/matchmaker/wsProxy.ts. Sidecars are NOT browser-exposed;
+# they're internal-only on ada-battles-net.
 
 services:
   matchmaker:
@@ -33,6 +35,17 @@ services:
       RUNNER_NETWORK:   "ada-battles-net"
       PUBLIC_WS_HOST:   "localhost"
       AUTH_SECRET:      "${AUTH_SECRET}"
+
+      # ── Hydra sidecar config (slice 1: offline mode) ──
+      # Pin the hydra-node image. Bump deliberately — API events
+      # and flags have moved across versions.
+      HYDRA_NODE_IMAGE: "ghcr.io/cardano-scaling/hydra-node:1.2.0"
+      # HOST path (not container path) to the dev-keys bundle. The
+      # matchmaker passes this through to docker.createContainer as
+      # a bind source, which Docker resolves on the host. Compose
+      # substitutes ${PWD} at up-time. If you move the repo, update
+      # this — there's no way to derive it from inside the container.
+      HYDRA_DEV_KEYS_HOST_PATH: "${PWD}/infra/hydra-dev-keys"
     volumes:
       # Allow the matchmaker to spawn sibling containers via the host's
       # Docker socket. In production, use a Kubernetes ServiceAccount
@@ -54,9 +67,10 @@ networks:
 # ── Notes ──────────────────────────────────────────────────────────
 #
 # Why is there only one service here?
-# Runners are *spawned by the matchmaker*, not declared in compose. The
-# matchmaker calls the Docker API to create them as siblings on the same
-# network. Compose owns the matchmaker; the matchmaker owns the runners.
+# Runners AND sidecars are *spawned by the matchmaker*, not declared
+# in compose. The matchmaker calls the Docker API to create them as
+# siblings on the same network. Compose owns the matchmaker; the
+# matchmaker owns runner+sidecar pairs.
 #
 # Reaching runners from the browser:
 # The matchmaker runs a WS-proxying reverse proxy that routes
@@ -65,5 +79,10 @@ networks:
 # an ingress (nginx, Traefik, k8s Ingress) doing the same path-based
 # routing.
 #
-# Cleaning up dangling runners after a crash:
-#   docker ps --filter "label=ada-battles.role=lobby-runner" -q | xargs -r docker rm -f
+# Sidecars are NEVER browser-exposed. The hydra-node API at port 4001
+# is reachable only from inside the docker network, addressed as
+# hydra-<lobbyId>:4001 by the runner.
+#
+# Cleaning up dangling runners + sidecars after a crash:
+#   docker ps --filter "label=ada-battles.role=lobby-runner"   -q | xargs -r docker rm -f
+#   docker ps --filter "label=ada-battles.role=hydra-sidecar"  -q | xargs -r docker rm -f

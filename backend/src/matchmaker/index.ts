@@ -16,7 +16,18 @@ const RUNNER_NETWORK = process.env.RUNNER_NETWORK ?? 'ada-battles-net';
 const PUBLIC_WS_HOST = process.env.PUBLIC_WS_HOST ?? 'localhost';
 const PUBLIC_PORT    = process.env.PUBLIC_PORT    ?? '8080';
 
-const orchestrator = new DockerOrchestrator(RUNNER_IMAGE, RUNNER_NETWORK);
+const HYDRA_NODE_IMAGE         = process.env.HYDRA_NODE_IMAGE
+  ?? 'ghcr.io/cardano-scaling/hydra-node:1.2.0';
+const HYDRA_DEV_KEYS_HOST_PATH = required('HYDRA_DEV_KEYS_HOST_PATH');
+
+const orchestrator = new DockerOrchestrator({
+  runnerImage:          RUNNER_IMAGE,
+  network:              RUNNER_NETWORK,
+  hydraImage:           HYDRA_NODE_IMAGE,
+  hydraDevKeysHostPath: HYDRA_DEV_KEYS_HOST_PATH,
+  authSecret:           AUTH_SECRET,
+});
+
 const matchmaker   = new Matchmaker(
   orchestrator,
   (id) => `ws://${PUBLIC_WS_HOST}:${PUBLIC_PORT}/lobby/${id}`,

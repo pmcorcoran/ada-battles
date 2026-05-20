@@ -11,7 +11,8 @@ Two services, one Docker image, two entrypoints:
 
 - **Matchmaker** — long-running, single instance. Stateless HTTP service plus
   WebSocket reverse proxy. Spawns lobby-runner containers on demand via the
-  Docker API. Also serves the static client bundle.
+  Docker API. Also serves the static client bundle (planned split — see
+  "Deferred: frontend split").
 - **Lobby-runner** — ephemeral, one container per match. Single-lobby game
   server. Boots from environment variables, hosts exactly one `Lobby`
   instance, self-exits when idle.
@@ -180,7 +181,6 @@ file.
 **`matchmaker/Matchmaker.ts`** — the class. Holds
 `lobbies: Map<string, LobbyRecord>`. Public methods:
 
-- `list()` — returns non-ended lobbies for `/api/lobbies`.
 - `match(maxPlayers)` — finds an existing open lobby with room (status
   `'lobby'` or `'starting'`), else spawns a new one. Accepting `'starting'`
   is what stops three tabs from spawning three separate runners.
@@ -188,8 +188,10 @@ file.
   `LobbyRecord`, starts heartbeat polling.
 - `beginPolling(record)` — polls each runner's `/status` every 2 seconds
   to refresh `status` and `playerCount`.
-- `reap()` — removes lobbies that are ended, empty for more than 60s, or
-  never came up. Runs on a 10-second interval.
+- `reap()` — removes lobbies whose runner has transitioned to `'ended'`,
+  or that never came up (stuck in `'starting'` for more than 60s). Runs
+  on a 10-second interval. Empty pre-match runners are kept alive
+  indefinitely — see "Deferred" for warm-pool eviction policy.
 
 Each `LobbyRecord` carries two URLs:
 - `wsUrl` — public URL given to the client
@@ -255,10 +257,6 @@ On WebSocket connection:
    `bullet-inactive`, `request-revive`, `request-start`, `request-restart`,
    and `disconnect`.
 
-Handlers for the four data-carrying events have inline payload type
-annotations duplicating types in `shared/types.ts`. This works around a
-`WebSocketHub.on()` overload-resolution quirk that drops contextual
-typing on the lambda parameter. To be fixed in a separate PR.
 
 Idle shutdown: `lastNonEmptyAt` is updated on every player join. When the
 lobby has been empty for `IDLE_SHUTDOWN_MS`, the process exits and
@@ -278,9 +276,19 @@ the `'connection'` handler and exposes it as `socket.url` for per-socket
 auth. No `path` option is set on `WebSocketServer`, which lets it accept
 upgrades on any path (the proxy rewrites to `/`).
 
-**`Lobby.ts`** — unchanged from the monolith. Holds the player map,
-bullet map, status state machine (`lobby → countdown → playing →
-ended`), broadcasts state via `hub.to(LOBBY_ID).emit('lobby-state', ...)`.
+**`Lobby.ts`** — holds the player map, bullet map, and status state
+  machine. Allowed transitions:
+
+      lobby     → countdown   (player count hits max)
+      lobby     → ended       (had players, all left before countdown)
+      countdown → playing     (countdown completes)
+      countdown → lobby       (player leaves during countdown)
+      playing   → ended       (clean win, or all but one player leaves)
+
+  `'ended'` is terminal — runners are one-shot per match. The client
+  re-matchmakes via `POST /api/lobbies/match` for a new game rather than
+  resetting the existing lobby. Broadcasts state via
+  `hub.to(LOBBY_ID).emit('lobby-state', ...)`.
 
 ### Shared
 
@@ -410,52 +418,77 @@ lives in `backend/src/auth/` rather than inline in `runner.ts`. When
 Hydra ticket verification lands, it composes here without touching the
 runner's connection handler.
 
-## Known follow-ups
 
-- End-to-end verification of the four scenarios on the new layout:
-  one-tab spawn, three-tab convergence, idle shutdown, bad-signature
-  rejection. `/healthz` and the static bundle are confirmed; the match
-  flow is not yet retested.
-- Fix `WebSocketHub.on()` overload resolution so the inline payload
-  type annotations in `runner.ts` can be removed.
-- Exclude `wire.check.ts` from the build via
-  `"../shared/**/*.check.ts"` in `backend/tsconfig.json` exclude.
-- Optionally make the static `public/` path an env var
-  (`PUBLIC_DIR=/app/public` in compose, relative fallback for host dev).
-- Verify the spectate flow end-to-end — `GET /api/lobbies/:id` should
-  issue a challenge the same way `POST /api/lobbies/match` does. Only
-  the match path has been exercised.
-- Possibly extract the client-authority combat logic from `GameScene.ts`
-  into its own module — but defer until Hydra integration starts and
-  the on-chain referee semantics are pinned down.
 
-## Deferred: Hydra integration
-
-- Add a `hydra-node` sidecar to each runner container. The sidecar is a
-  separate container (Haskell, ~100MB image) speaking the hydra-node API
-  to the runner over the shared pod network. The runner doesn't need
-  hydra tooling inside its own image — it talks to the sidecar over the
-  hydra-node API socket. The single-image-two-entrypoints model survives.
-- New backend module: `backend/src/hydra/` — home for
-  `refereeTxBuilder.ts`, `hydraProvider.ts`, and sidecar coordination.
-- Replace in-memory `Lobby` authority with the on-chain referee contract
-  via the existing `txbuilder_referee.py` and `hydra_chain_context.py`.
-- Add a bullet ID counter to `BoardDatum` to prevent simultaneous-shoot
-  races on-chain.
-- Add ticket-NFT verification as a third check in
-  `verifyWalletChallenge`.
-- Warm-pool eviction policy. Currently empty runners live forever once spawned.
-  No cap, no oldest-first reaping. Acceptable now since traffic is low; revisit
-  if idle runners start consuming meaningful resources.
-- when a player disconnects during countdown, lubby correctly reverts from countdown to 
-  waiting room lobby, but a remnant of the countdown clock still appears on canvas. Minor bug.
-- Spectate flow: GET /api/lobbies/:id should issue a challenge the same way
-  POST /api/lobbies/match does.
-- Deffering all spectate things in general.
-- `wire.check.ts` ships to dist; exclude from backend/tsconfig.json when convenient.
-- TS module resolution migration. `moduleResolution: "node"` is deprecated in
-  TS 7. Migrate to `"node16"` or `"nodenext"` — requires adding explicit `.js`
-  extensions to all relative imports in backend/ and shared/.
+## Deferred
+ 
+  ### Hydra integration (next)
+ 
+  - Add a `hydra-node` sidecar to each runner container. The sidecar is a
+    separate container (Haskell, ~100MB image) speaking the hydra-node API
+    to the runner over the shared pod network. The runner doesn't need
+    hydra tooling inside its own image — it talks to the sidecar over the
+    hydra-node API socket. The single-image-two-entrypoints model survives.
+  - New backend module: `backend/src/hydra/` — home for
+    `refereeTxBuilder.ts`, `hydraProvider.ts`, and sidecar coordination.
+  - Replace in-memory `Lobby` authority with the on-chain referee contract
+    via the existing `txbuilder_referee.py` and `hydra_chain_context.py`.
+  - Add a bullet ID counter to `BoardDatum` to prevent simultaneous-shoot
+    races on-chain.
+  - Add ticket-NFT verification as a third check in
+    `verifyWalletChallenge`.
+  - Sidecar lifecycle question: when a runner self-exits on idle (or is
+    SIGTERM'd by the matchmaker after `'ended'`), what happens to the
+    in-flight Hydra Head? Decide whether the runner orchestrates a clean
+    Head close (init close → contestation deadline → fanout → exit) or
+    whether the sidecar lifecycle is independent and an unclean exit
+    leaves the Head in a contestable state.
+ 
+  ### Frontend split (after Hydra)
+ 
+  Split static frontend serving from the matchmaker. Plan: add a Caddy
+  reverse proxy as the public-facing service. Caddy serves the static
+  bundle and reverse-proxies `/api/*` and `/lobby/*` to the matchmaker.
+  Matchmaker stops serving static files and stops publishing a host port
+  (becomes internal-only on `ada-battles-net`).
+ 
+  - New service in `docker-compose.yml`: `caddy` (image `caddy:2-alpine`),
+    publishes :80/:443, bind-mounts `./public` and a `Caddyfile`.
+  - Matchmaker change: delete the `express.static` and SPA-fallback blocks
+    from `matchmaker/http.ts`. Drop the static path entirely. Drop the
+    `ports:` block from compose.
+  - Frontend bundle deploy: build on host (or CI), bind-mount into Caddy.
+    Removes the frontend build steps from the matchmaker Dockerfile.
+  - TLS: Caddy auto-provisions Let's Encrypt certs in production when
+    given a named host block.
+  - No frontend code changes — single origin preserved, so no CORS work.
+  - Deferred until after Hydra lands. Hydra is core gameplay; this is
+    infrastructure cleanup that doesn't unblock anything.
+ 
+  ### Other
+ 
+  - Warm-pool eviction policy. Empty runners live forever once spawned.
+    No cap, no oldest-first reaping. Acceptable now since traffic is low;
+    revisit if idle runners start consuming meaningful resources.
+  - Countdown clock UI remnant. When a player disconnects during
+    countdown, the lobby correctly reverts from `'countdown'` to `'lobby'`
+    on the server, but a remnant of the countdown clock still appears on
+    canvas. Minor bug, client-side render state isn't being cleared.
+  - Spectate flow. `GET /api/lobbies/:id` should issue a challenge the
+    same way `POST /api/lobbies/match` does. Pre-existing follow-up from
+    before the refactor. Deferring spectate work in general for now.
+  - Optionally make the static `public/` path an env var
+    (`PUBLIC_DIR=/app/public` in compose, relative fallback for host
+    dev). Obsoleted by the frontend split if/when that lands.
+  - TS module resolution migration. `moduleResolution: "node"` is
+    deprecated in TS 7. Migrate to `"node16"` or `"nodenext"` — requires
+    adding explicit `.js` extensions to all relative imports in
+    `backend/` and `shared/`. Suppressed via `ignoreDeprecations: "5.0"`
+    in the meantime.
+  - Possibly extract the client-authority combat logic from
+    `GameScene.ts` into its own module — but defer until Hydra
+    integration starts and the on-chain referee semantics are pinned
+    down.
 
 ## Operational notes
 
