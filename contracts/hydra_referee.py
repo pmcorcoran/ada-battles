@@ -52,6 +52,19 @@ OPEN DECISIONS (see HANDOFF.md):
 
 This file is still pre-production: the parameters need tuning and it needs an
 on-chain test suite (opshin supports running the validator as plain Python).
+
+PLUTUS V3 SIGNATURE
+-------------------
+Current OpShin (>= ~0.27, prelude api_v3) compiles to Plutus V3, where a
+spending validator takes ONLY the ScriptContext on-chain:
+
+    def validator(context: ScriptContext) -> None
+
+The datum and redeemer are pulled OUT of the context (own_datum_unsafe(context)
+and context.redeemer), NOT passed as separate parameters. The old
+`validator(datum, redeemer, context)` form (V1/V2, and most older tutorials)
+is rejected by the V3 compiler with "expects only the ScriptContext". The
+test harness in contracts/test/fixtures.py builds contexts accordingly.
 """
 
 from opshin.prelude import *
@@ -106,6 +119,8 @@ BULLET_COUNT: int = 4
 @dataclass()
 class Bullet(PlutusData):
     CONSTR_ID = 0
+    # Owner of the bullet — used by peers off-chain for kill attribution.
+    # Carried on-chain but not validated by the referee (slice-2 consumers).
     owner: PubKeyHash
     # True if the bullet is in flight, False if it's a free slot ready to fire.
     is_active: bool
@@ -120,7 +135,7 @@ class Bullet(PlutusData):
 class PlayerState(PlutusData):
     """The datum locked at this player's referee UTxO."""
     CONSTR_ID = 0
-    id: PubKeyHash
+    owner: PubKeyHash
     x: int
     y: int
     health: int
@@ -151,19 +166,7 @@ def abs_int(v: int) -> int:
     return v
 
 
-def own_spent_txout(txins: List[TxInInfo], purpose: Spending) -> TxOut:
-    """The resolved TxOut being spent by this script invocation."""
-    own: TxOut = txins[0].resolved  # placeholder init; reassigned in loop
-    found: bool = False
-    for txi in txins:
-        if txi.out_ref == purpose.tx_out_ref:
-            own = txi.resolved
-            found = True
-    assert found, "could not resolve own spent UTxO"
-    return own
-
-
-def continuing_output(outputs: List[TxOut], own_address: Address) -> TxOut:
+def continuing_output(outputs: List[TxOut], own_addr: Address) -> TxOut:
     """The single output that returns state to this script address.
 
     Exactly one is required: a checkpoint advances one player's state to a new
@@ -172,7 +175,7 @@ def continuing_output(outputs: List[TxOut], own_address: Address) -> TxOut:
     result: TxOut = outputs[0]  # placeholder init; reassigned below
     count: int = 0
     for o in outputs:
-        if o.address == own_address:
+        if o.address == own_addr:
             result = o
             count += 1
     assert count == 1, "must produce exactly one continuing state output"
@@ -180,10 +183,16 @@ def continuing_output(outputs: List[TxOut], own_address: Address) -> TxOut:
 
 
 def output_player_state(o: TxOut) -> PlayerState:
-    """Read the inline PlayerState datum from a continuing output."""
+    """Read the inline PlayerState datum from a continuing output.
+
+    V3 prelude: the output datum is an OutputDatum union; an inline datum is
+    a SomeOutputDatum carrying the PlutusData. We assert it's inline and bind
+    the inner datum to the PlayerState type (OpShin infers the cast).
+    """
     d: OutputDatum = o.datum
     assert isinstance(d, SomeOutputDatum), "continuing output must carry an inline datum"
-    return resolve_datum_unsafe(o, SomeOutputDatum)  # typed extraction
+    inner: PlayerState = d.datum
+    return inner
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -191,19 +200,25 @@ def output_player_state(o: TxOut) -> PlayerState:
 # ──────────────────────────────────────────────────────────────────────
 
 def validator(context: ScriptContext) -> None:
+    # PlutusV3: the validator takes ONLY the ScriptContext on-chain. The datum
+    # of the UTxO being spent and the redeemer are pulled out of the context,
+    # not passed as separate parameters (that was the V1/V2 / older-OpShin
+    # signature, and is rejected by the V3 compiler).
     purpose: ScriptPurpose = context.purpose
     assert isinstance(purpose, Spending), "referee is a spending validator"
     spending: Spending = purpose
+
     datum: PlayerState = own_datum_unsafe(context)
     redeemer: PlayerInput = context.redeemer
 
     tx_info: TxInfo = context.transaction
 
     # Resolve our own address from the UTxO we're spending, then find the single
-    # continuing output that carries the player's NEW state.
-    own_in: TxOut = own_spent_txout(tx_info.inputs, spending)
-    own_address: Address = own_in.address
-    new_out: TxOut = continuing_output(tx_info.outputs, own_address)
+    # continuing output that carries the player's NEW state. own_spent_utxo is
+    # provided by the prelude.
+    own_in: TxOut = own_spent_utxo(tx_info.inputs, spending)
+    own_addr: Address = own_in.address
+    new_out: TxOut = continuing_output(tx_info.outputs, own_addr)
     new_state: PlayerState = output_player_state(new_out)
 
     # ── Identity: a player can only advance their own state ─────────────
