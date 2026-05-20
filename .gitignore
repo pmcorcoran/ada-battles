@@ -14,3 +14,4 @@ dist/
 package-lock.json
 HANDOFF.md
 infra/hydra-dev-keys/*
+contracts/hydra_referee2.py

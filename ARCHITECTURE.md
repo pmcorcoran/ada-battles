@@ -13,9 +13,14 @@ Two services, one Docker image, two entrypoints:
   WebSocket reverse proxy. Spawns lobby-runner containers on demand via the
   Docker API. Also serves the static client bundle (planned split — see
   "Deferred: frontend split").
-- **Lobby-runner** — ephemeral, one container per match. Single-lobby game
-  server. Boots from environment variables, hosts exactly one `Lobby`
-  instance, self-exits when idle.
+- **Lobby-runner** —  ephemeral, one container per match. Single-lobby game
+  server. Boots from environment variables, hosts exactly one Lobby
+  instance, self-exits when idle. Each runner is paired with a hydra-node
+  sidecar container (see "Hydra sidecar" below).
+- **Hydra-node sidecar** — ephemeral, one per runner. A stock upstream
+  hydra-node image (not built from this repo). The runner talks to it
+  over its WebSocket API on the shared Docker network. In slice 1 it runs
+  in offline mode and is observed but not authoritative.
 
 The client only ever talks to one URL: the matchmaker's. WebSocket upgrades on
 `/lobby/<id>` are reverse-proxied through the matchmaker to the appropriate
@@ -30,9 +35,15 @@ runner container.
 │                                          ▼
 │                                  ┌────────────────┐
 │                                  │ runner-<uuid>  │
-│                                  │ :3000          │
-│                                  │ (one Lobby)    │
-│                                  └────────────────┘
+│                                  │ :3000          │      ws (offline API)
+│                                  │ (one Lobby)    │ ───────────────────┐
+│                                  └────────────────┘                    │
+│                                                                        ▼
+│                                                          ┌──────────────────────┐
+│                                                          │ hydra-<uuid>         │
+│                                                          │ :4001 (hydra-node)   │
+│                                                          │ offline; observed    │
+│                                                          └──────────────────────┘
 
 ## Repository layout
 
@@ -47,8 +58,16 @@ ada-battles/
 ├── ARCHITECTURE.md                     # this file
 │
 ├── contracts/
-│   ├── hydra_referee.py                # OpShin: client-authority referee
+│   ├── hydra_referee.py                # OpShin: anti-griefing referee (INCOMPLETE sketch)
 │   └── ticket_minting_contract.py
+│
+├── infra/
+│   └── hydra-dev-keys/                 # slice-1 throwaway Hydra key bundle
+│       ├── hydra.sk / hydra.vk         # generated; not for any real network
+│       ├── initial-utxo.json           # offline-mode L2 seed UTxO
+│       └── protocol-parameters.json    # Hydra zero-fee params
+│
+├── Makefile                            # `make hydra-dev-keys` regenerates the bundle
 │
 ├── shared/                             # pure TS, isomorphic
 │   ├── authChallenge.ts                # HMAC challenge issue/verify
@@ -72,11 +91,16 @@ ada-battles/
 │       │   └── orchestrator/
 │       │       ├── OrchestratorSPI.ts
 │       │       └── DockerOrchestrator.ts
-│       ├── runner.ts                   # single-lobby server entry
+│       ├── runner.ts                   # single-lobby server entry (boots Hydra observer)
 │       ├── Lobby.ts                    # per-match game state + tick loop
 │       ├── WebSocketHub.ts             # typed ws wrapper, exposes socket.url
+│       ├── hydra/                       # Hydra sidecar integration (slice 1: observe-only)
+│       │   ├── HydraSidecarClient.ts   # ws client to hydra-node API
+│       │   ├── HydraObserver.ts        # event→status reduction; consensus-peer seam
+│       │   ├── types.ts                # narrow event/status vocabulary
+│       │   └── index.ts                # barrel
 │       └── auth/
-│           └── walletChallenge.ts      # verifyWalletChallenge
+│           └── walletChallenge.ts      # verifyWalletChallenge (+ticket-NFT TODO)
 │
 └── frontend/
 ├── package.json
@@ -228,20 +252,45 @@ logs failures explicitly — without it, proxy failures were silent.
 without touching anything else.
 
 **`matchmaker/orchestrator/DockerOrchestrator.ts`** — `dockerode`-backed
-implementation. Each runner is created with `AutoRemove: true`, attached
-to `ada-battles-net`, given a network alias matching its container name
-(`runner-<uuid>`), and passed `LOBBY_ID`, `MAX_PLAYERS`, and
-`AUTH_SECRET` as environment variables. The Cmd override is
+implementation. Takes an options object
+(`{ runnerImage, network, hydraImage, hydraDevKeysHostPath, authSecret, … }`)
+— note this changed from the original positional `(image, network, port)`
+signature when the sidecar was added.
+`spawn()` creates two containers per match: the sidecar
+(`hydra-<uuid>`) first so the runner can connect on boot, then the runner
+(`runner-<uuid>`). If the runner fails to start, the sidecar is rolled
+back. Both are `AutoRemove: true`, attached to `ada-battles-net` with
+name-matching aliases. The runner gets `LOBBY_ID`, `MAX_PLAYERS`,
+`AUTH_SECRET`, and `HYDRA_SIDECAR_URL`
+(`ws://hydra-<uuid>:4001/?history=no`). The Cmd override is
 `['node', 'dist/backend/src/runner.js']`.
+The sidecar is an implementation-private sibling: `OrchestratorSPI`
+and `SpawnResult` are unchanged, the matchmaker tracks only the runner,
+and `DockerOrchestrator` maps runner→sidecar internally so `stop()` reaps
+both. The sidecar launches in offline mode (`--offline-head-seed`,
+`--initial-utxo`, `--ledger-protocol-parameters`, `--hydra-signing-key`)
+with the `infra/hydra-dev-keys/` bundle bind-mounted read-only at
+`/run/hydra`. The bind source is `hydraDevKeysHostPath`, which is a host
+path resolved by the Docker daemon, not a path inside the matchmaker
+container.
 
 ### Backend — runner
 
-**`runner.ts`** — the per-match server. Reads `LOBBY_ID`, `MAX_PLAYERS`,
-`PORT`, `IDLE_SHUTDOWN_MS`, `AUTH_SECRET` from the environment.
-Constructs one `Lobby`. Exposes `GET /status` (matchmaker heartbeat) and
-`GET /healthz`. Binds explicitly to `0.0.0.0` — without this, Node bound
-IPv6-only inside Alpine and IPv4 connections from siblings on the same
-Docker network were refused.
+**`runner.ts`** the per-match server. Reads `LOBBY_ID`, `MAX_PLAYERS`,
+`PORT`, `IDLE_SHUTDOWN_MS`, `AUTH_SECRET`, and `HYDRA_SIDECAR_URL` from the
+environment. Constructs one `Lobby`. Exposes `GET /status` (matchmaker
+heartbeat, now including a `hydraStatus` field) and `GET /healthz`. Binds
+explicitly to `0.0.0.0` — without this, Node bound IPv6-only inside Alpine
+and IPv4 connections from siblings on the same Docker network were refused.
+After the HTTP server is listening, the runner boots a `HydraObserver`
+(from `backend/src/hydra/`) pointed at `HYDRA_SIDECAR_URL`. In slice 1 the
+observer is non-authoritative — it logs Head state alongside the
+in-memory `Lobby` but does not affect gameplay, and a sidecar that fails
+to come up is logged-and-ignored rather than fatal. The runner owns the
+sidecar lifecycle (decision (ii)): `shutdown()` awaits
+`observer.stop()` before closing the HTTP server. If `HYDRA_SIDECAR_URL`
+is unset the observer is disabled entirely (e.g. for a runner spawned
+outside the orchestrator).
 
 On WebSocket connection:
 
@@ -261,6 +310,39 @@ On WebSocket connection:
 Idle shutdown: `lastNonEmptyAt` is updated on every player join. When the
 lobby has been empty for `IDLE_SHUTDOWN_MS`, the process exits and
 Docker's `AutoRemove` cleans up the container.
+
+
+
+### Backend — Hydra sidecar (backend/src/hydra/)
+
+Slice-1 scope: stand up the sidecar, talk to it, observe it. No
+authority moves on-chain yet. Three small files plus a barrel.
+`HydraSidecarClient.ts` — a thin ws client to the sidecar's API at
+`ws://hydra-<uuid>:4001/?history=no`. Has startup-time reconnect (~12×1s)
+because Docker `start()` returns before the hydra-node process binds its
+port. Clean close on a 5s budget. No mid-session reconnect yet. Surface:
+`connect()`, `on('output'|'error'|'close', …)`, `send(cmd)`, `close()`.
+send() exists but is unused in slice 1 — reserved for slice-2 commands
+(Init / Commit / SafeClose / Fanout).
+`HydraObserver.ts` — subscribes to the client and reduces the
+hydra-node event stream to a coarse `HydraStatus`
+(`connecting → idle/initializing/open/closed/finalized/aborted/error`),
+logging each transition. In offline mode the head is born `Open`, so
+`idle` is effectively unreachable until slice 2's online mode introduces a
+real `idle → initializing → open` progression. This is the authority
+seam for slice 2 — the `handleOutput` switch is where on-chain referee
+calls into `Lobby` will live.
+`types.ts` — narrow event-tag and status vocabulary, deliberately kept
+out of `shared/types.ts`. These are backend-internal until clients need to
+react to Head state (slice 2+), at which point the relevant subset gets
+promoted to `shared/`.
+The sidecar runs a stock upstream `hydra-node` image
+(`ghcr.io/cardano-scaling/hydra-node:1.2.0`); no Haskell tooling enters
+the runner image. This preserves the single-image-two-entrypoints model:
+the matchmaker and runner are still the same image, and the sidecar is a
+third, external image pulled at runtime.
+
+
 
 ### Backend — shared infrastructure
 
@@ -418,31 +500,113 @@ lives in `backend/src/auth/` rather than inline in `runner.ts`. When
 Hydra ticket verification lands, it composes here without touching the
 runner's connection handler.
 
+**Hydra sidecar as implementation-private sibling.** Each runner is paired
+with a hydra-node sidecar, but `OrchestratorSPI` and `SpawnResult` are
+unchanged — the sidecar is hidden inside `DockerOrchestrator`, which reaps
+the pair together. The matchmaker only ever knows about the runner. This
+keeps the orchestration seam clean: a future K8s implementation models the
+pair as a two-container Pod behind the same interface, with nothing else
+in the matchmaker package aware of the sidecar.
+
+**Sidecar lifecycle owned by the runner (option ii).** When a runner
+exits, it first closes its sidecar (slice 1: a clean WS close; slice 2:
+SafeClose → Fanout → HeadIsFinalized → exit) before closing its own HTTP
+server. The alternative — an independent sidecar lifecycle — was rejected
+because an unclean exit with an open Hydra Head leaves it in a contestable
+state. This is why `runner.ts` `shutdown()` is async and awaits the
+observer.
+
+**Security model: N-of-N consensus, not server authority.** Slice 1's
+Lobby is a trusted single authority — this is scaffolding, not the
+target. In slice 2, every checkpoint state transition is signed by all N
+players; no server or client is trusted to assert game state. A cheating
+proposal (omitting a hit taken, fabricating damage) is one the honest
+peers' deterministic simulations disagree with, so they refuse to sign and
+it cannot advance the head. Combat correctness — hit detection, damage,
+elimination, bullet flight physics — is enforced by peer consensus, not by
+the runner and not by the referee contract. The referee contract is
+anti-griefing / O(1) bounds-checking only: it makes certain cheats
+impossible to even propose in a locally-valid-looking way (notably bullet
+spawn position and initial direction), giving honest peers a cheap
+rejection criterion. This mirrors the IOG Hydra Doom approach. State
+checkpoints are signed every k frames (k=7 to start), not every 35 FPS
+frame, to keep L2 throughput sane for 3–4 player tables.
+
+
 
 
 ## Deferred
  
-  ### Hydra integration (next)
- 
-  - Add a `hydra-node` sidecar to each runner container. The sidecar is a
-    separate container (Haskell, ~100MB image) speaking the hydra-node API
-    to the runner over the shared pod network. The runner doesn't need
-    hydra tooling inside its own image — it talks to the sidecar over the
-    hydra-node API socket. The single-image-two-entrypoints model survives.
-  - New backend module: `backend/src/hydra/` — home for
-    `refereeTxBuilder.ts`, `hydraProvider.ts`, and sidecar coordination.
-  - Replace in-memory `Lobby` authority with the on-chain referee contract
-    via the existing `txbuilder_referee.py` and `hydra_chain_context.py`.
-  - Add a bullet ID counter to `BoardDatum` to prevent simultaneous-shoot
-    races on-chain.
-  - Add ticket-NFT verification as a third check in
-    `verifyWalletChallenge`.
-  - Sidecar lifecycle question: when a runner self-exits on idle (or is
-    SIGTERM'd by the matchmaker after `'ended'`), what happens to the
-    in-flight Hydra Head? Decide whether the runner orchestrates a clean
-    Head close (init close → contestation deadline → fanout → exit) or
-    whether the sidecar lifecycle is independent and an unclean exit
-    leaves the Head in a contestable state.
+  **Slice 1 (DONE):** non-authoritative sidecar. Each runner spawns a
+  hydra-node sidecar in offline mode, connects to its WS API, and logs Head
+  state alongside the in-memory `Lobby`. See "Backend — Hydra sidecar" and
+  `HANDOFF.md`.
+  
+  **Slice 2 (NEXT): consensus-enforced gameplay.** Replace the in-memory
+  single authority with Hydra N-of-N consensus (see "Security model" in
+  Architectural decisions). In rough dependency order:
+
+
+  
+  - **Invert the match flow.** A real Head needs all participants' keys at
+    node-launch time, so the matchmaker must collect N authenticated wallets
+    in a pre-match waiting room *before* spawning the runner+sidecar. This is
+    the biggest structural change — design it before coding. Touches
+    `Matchmaker.match()`, `http.ts`, and the client match flow.
+  - **Pick a Cardano TS library** (Lucid Evolution / Mesh / `@cardano-sdk`)
+    for `refereeTxBuilder.ts`. Deferred in slice 1; now blocking.
+  - **Make the runner a consensus peer.** `HydraObserver.handleOutput` stops
+    logging and starts tracking `SnapshotConfirmed`; the runner builds,
+    validates, and co-signs checkpoint transitions. Combat correctness is
+    enforced by peers refusing to sign bad transitions, not by the runner.
+    New files `backend/src/hydra/refereeTxBuilder.ts` and `hydraProvider.ts`.
+    - **Add ticket-NFT verification** as a third predicate in
+    `walletChallenge.ts`.
+  - **Switch sidecar offline → online:** real preprod cardano-node,
+    per-match keys generated at runner startup (into tmpfs), real Commits
+    replacing `--initial-utxo`, fresh protocol params. Retire
+    `infra/hydra-dev-keys/`.
+  - **Implement the clean Head close** in `runner.ts shutdown()` (SafeClose →
+    ReadyToFanout → Fanout → HeadIsFinalized → exit), reconciled with
+    `IDLE_SHUTDOWN_MS` and `AutoRemove`.
+  
+  **Referee contract scope** (`contracts/hydra_referee.py`). An incomplete
+  sketch, scope deliberately narrowed to O(1) per-checkpoint checks — do
+  not reintroduce per-bullet physics. Checkpoints are signed every k=7
+  frames (players simulate at 35 FPS locally; a signed script transition
+  happens every 7 frames — ~5/sec, ~15–20 signed L2 txs/sec across the
+  table). Target table size 3–4 players. The contract's `current_frame`
+  is a checkpoint counter, not a frame counter.
+  The contract validates, per checkpoint:
+
+  Bullet spawn position — a bullet created since the last checkpoint
+  originates within a bounding box around the muzzle point
+  `shooter_pos + (cos rot, sin rot)·(PLAYER_SIDE + BULLET_RADIUS)` (the
+  formula `Lobby.tryShoot` uses today). The box must absorb worst-case
+  float→int and rotation-quantization error. This is the core anti-cheat:
+  stops a player fabricating a bullet on top of a target.
+  Bullet initial direction — a newly-fired bullet's `dir_x/dir_y`
+  matches the shooter's aim at fire time (`aim_dir_x/aim_dir_y`).
+  Movement bound — per-checkpoint displacement within the k-frame
+  budget. The sketch's `MAX_SPEED` is per-frame; the checkpoint bound is
+  `per_frame_speed × k` (+tolerance). Introduce an explicit constant
+  (e.g. `MAX_DISPLACEMENT_PER_CHECKPOINT`) so k lives in one place.
+  Shot cooldown — `COOLDOWN_FRAMES` between shots.
+  Dead-player gate — health ≤ 0 ⇒ no move, no shoot.
+
+  Peers validate off-chain and enforce by signing / refusing to sign:
+  bullet flight physics (`BULLET_SPEED` along the established
+  trajectory) and collision/hit resolution; bullet-array integrity is
+  likely peer-owned (open).
+  Dropped from the sketch: the `for i in range(4)` per-bullet physics
+  loop, the flight-position asserts, and the triplicated state-extraction
+  blocks. Sketch bugs to fix on rewrite: no-op address check (use
+  `own_address_unsafe`), triplicated extraction, duplicated speed/cooldown
+  asserts, re-assigned validator params. Open decisions: exact spawn-box
+  tolerance (depends on the on-chain coordinate float→int strategy), whether
+  bullet-array integrity is contract- or peer-enforced, and confirming the
+  k=7 / 3–4-player throughput against a real head before building on it. See
+  `HANDOFF.md`.
  
   ### Frontend split (after Hydra)
  
@@ -485,17 +649,18 @@ runner's connection handler.
     adding explicit `.js` extensions to all relative imports in
     `backend/` and `shared/`. Suppressed via `ignoreDeprecations: "5.0"`
     in the meantime.
-  - Possibly extract the client-authority combat logic from
-    `GameScene.ts` into its own module — but defer until Hydra
-    integration starts and the on-chain referee semantics are pinned
-    down.
+  - Possibly extract the local combat-simulation logic from
+    `GameScene.ts` into its own module — it will be reused as the
+    deterministic per-peer simulation that drives consensus signing. Defer
+    until the referee/checkpoint semantics are pinned down.
 
 ## Operational notes
 
 **Cleaning up dangling runners after a matchmaker crash:**
 
 ```bash
-docker ps --filter "label=ada-battles.role=lobby-runner" -q | xargs -r docker rm -f
+docker ps --filter "label=ada-battles.role=lobby-runner"  -q | xargs -r docker rm -f
+docker ps --filter "label=ada-battles.role=hydra-sidecar" -q | xargs -r docker rm -f
 ```
 
 **Verifying runner reachability from the matchmaker:**
@@ -537,3 +702,10 @@ documented here so future operators don't have to rediscover them):
   extension)* — backend tsconfig was set to ESM, which requires `.js`
   extensions on every relative import. Fix: switch backend to
   `module: "commonjs"` / `moduleResolution: "node"`.
+- *Sidecar exits immediately, runner logs "sidecar unreachable"* — usually
+  a bad offline-mode flag or a missing/!malformed file in
+  `infra/hydra-dev-keys/`. Check `docker logs hydra-<id>`. Regenerate the
+  bundle with `make hydra-dev-keys`.
+- *`make hydra-dev-keys` fails with "executable file not found: hydra-node"*
+  — don't pass `--entrypoint hydra-node`; the image entrypoint already is
+  the binary. Pass `gen-hydra-key …` as arguments only.
