@@ -1,65 +1,81 @@
-# v0.0.1 Grid-Based Hydra PoC
+# Ada Battles
 
-## Overview
-This repository contains the v0.0.1 Proof of Concept (PoC) for a decentralized, real-time gaming architecture built on Cardano Hydra. This PoC strips away advanced tokenomics and high-frequency real-time execution to validate the core goal: **using an smart contract(s) as an authoritative referee for off-chain state channel transitions.**
+A multiplayer top-down shooter on Cardano. Players join short PvP matches, move
+and shoot in real time, and the game's combat state is settled on a Cardano
+**Hydra Head** — a layer-2 state channel — rather than a trusted game server.
 
-This is a turn-based, 2D grid game running strictly on the Cardano Preprod Testnet and hydra using test ADA (tADA). 
+The project is a refactor of an earlier Web2 monolith into a containerised
+system built to integrate Hydra, with on-chain anti-cheat enforced by smart
+contracts.
 
-**For the ultimate vision of the project, and the 2 month goal, see 
-docs/VISION.md**
+---
 
-## Architecture & Tech Stack
-* **Frontend:** TypeScript
-* **Smart Contracts:** Aiken
-* **Cardano Network:** Preprod Testnet
-* **Infrastructure:** Single local `cardano-node` and single local `hydra-node`
-* **Networking:** Pure WebSockets connected to the local Hydra Node 
-* **Data Payload:** Standard JSON (No WebAssembly or binary compression for this phase)
+## What it is
 
-## Game Mechanics
-* **Arena:** 10x10 grid coordinate system.
-* **Players:** Supports 3 players.
-* **Pacing:** Turn-based.
-* **Wager:** Funded purely via Preprod tADA.
-* **Win Condition:** Reduce opponent HP to `0`. The final surviving player claims the tADA locked in the Head upon closure.
+- **A real-time arena shooter.** Small matches (target 3–4 players), 35 FPS
+  client simulation, movement + shooting + bullet flight, health, eliminations,
+  and self-revive.
+- **Settled on Hydra, not on a server.** Game state transitions are validated by
+  on-chain referee contracts running inside a Hydra Head, so correctness does
+  not depend on trusting the operator's game server.
+- **Browser-only for players.** Players connect a Cardano wallet and play in the
+  browser. They do not run their own Hydra node.
 
-## The Smart Contract (The Referee)
-The core of this PoC is the Aiken validator, which acts as the game server's physics engine and rule enforcer. It evaluates standard JSON-compatible state payloads passed through the Hydra Head.
+## How it's put together
 
-### The State (Datum)
-The UTXO datum inside the Hydra Head represents the entire board state.
-```json
-{
-  "turn": 1,
-  "players": [
-    {
-      "id": 1,
-      "pubKey": "ed25519_pub_key_A...",
-      "x": 0,
-      "y": 0,
-      "hp": 3
-    },
-    {
-      "id": 2,
-      "pubKey": "ed25519_pub_key_B...",
-      "x": 9,
-      "y": 9,
-      "hp": 3
-    }
-  ]
-}
+Two services from a single Docker image with two entrypoints:
+
+- **Matchmaker** — one long-running instance. Authenticates players, forms
+  matches, serves the client, and reverse-proxies each player's WebSocket
+  connection to the right match.
+- **Lobby-runner** — one ephemeral container per match. Runs a single game
+  lobby and self-exits when idle. Each runner is paired with a **hydra-node
+  sidecar** that hosts the match's Hydra Head.
+
+The browser only ever talks to the matchmaker; the matchmaker spawns and proxies
+to runners on demand.
+
+## The trust model in one paragraph
+
+A Cardano validator can only reject a *submitted* transaction, so it naturally
+catches "commission" cheats (proposing an illegal move) but is blind to
+"omission" cheats (refusing to apply a true fact, like ignoring a hit you took).
+Ada Battles closes that gap by making **damage shooter-asserted**: the player who
+fires authors the transaction that damages their target, so a victim can't hide
+a hit by staying silent. The contract then verifies the hit really connects.
+Player state is split across separate UTxOs (position, bullets, health) so the
+common per-tick writes never contend and the only cross-player write — damage —
+is isolated. See `contracts/README.md` for the full design.
+
+## Repository layout
+
+```
+ada-battles/
+├── backend/      matchmaker + lobby-runner (TypeScript)
+├── frontend/     browser client
+├── shared/       isomorphic TS shared by client and server
+├── contracts/    on-chain referee + ticket contracts (opshin / Plutus V3)
+├── Dockerfile    single multi-stage image, two entrypoints
+├── docker-compose.yml    
+└── ARCHITECTURE.md
 ```
 
-### Actions (Redeemers)
-Players submit transactions to the Hydra Head using specific redeemers to alter the state:
-- `Move(DeltaX, DeltaY)`: Adjusts the player's X/Y coordinates.
-    
-- `Shoot(TargetX, TargetY)`: Attacks a specific coordinate on the grid.
+## Status
 
-### State Validation Rules
-The Aiken contract strictly enforces the following rules before allowing a state update in the Head:
-- **Turn Authentication:** The transaction signature must match the `pubKey` of the player whose turn it currently is.   
-- **Boundaries:** `Move` actions cannot result in X/Y coordinates outside the 10x10 grid (`0` to `9`).   
-- **Speed Limits:** A player can only move one tile per turn. Mathematical constraint: `abs(new_x - old_x) + abs(new_y - old_y) <= 1`.  
-- **Collision & Damage:** If a `Shoot` coordinate matches an enemy player's X/Y coordinate, the resulting state datum MUST show that enemy's `hp` reduced by exactly `1`.   
-- **Turn Progression:** The new state datum MUST correctly increment the `turn` integer.
+The system is being built up to full Hydra integration in slices.
+
+- **Done:** the containerised matchmaker/runner split, wallet authentication,
+  and the first Hydra slice — each runner spawns a hydra-node sidecar, connects
+  to it, and observes Head state (offline mode, not yet authoritative).
+- **In progress:** making the Head authoritative — the three referee validators
+  (`position`, `bullets`, `health`) are designed and compiling, and the
+  remaining work is the inverted match flow, the off-chain transaction builder,
+  ticket-NFT verification, and switching the sidecar from offline to online.
+
+For the on-chain design and decisions, see **`contracts/README.md`**. For the
+system architecture, see **`ARCHITECTURE.md`**.
+
+## Tech
+
+TypeScript (client, matchmaker, runner), Docker, Cardano, Hydra, and opshin
+(Python-to-Plutus) for the contracts.
