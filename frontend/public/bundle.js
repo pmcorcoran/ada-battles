@@ -531,9 +531,6 @@
     requestStart() {
       this.send("request-start", void 0);
     }
-    requestRestart() {
-      this.send("request-restart", void 0);
-    }
     sendInput(keys, rotation) {
       this.send("player-input", { keys, rotation });
     }

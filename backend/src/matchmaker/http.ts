@@ -7,20 +7,33 @@
  */
 
 import express, { type Express } from 'express';
-import path from 'path';
 import type { Matchmaker } from './Matchmaker';
 import { issueChallenge } from '../../../shared/authChallenge';
 
-export function createApp(matchmaker: Matchmaker, authSecret: string): Express {
+export function createApp(
+  matchmaker: Matchmaker, 
+  authSecret: string, 
+  allowedOrigins: string[],
+): Express {
   const app = express();
   app.use(express.json());
 
-  // Static client bundle + SPA fallback so deep links work.
-  app.use(express.static(path.join(__dirname, '../../../../public')));
-  app.get(/^(?!\/api\/|\/lobby\/|\/healthz).*/, (_req, res) => {
-    res.sendFile(path.join(__dirname, '../../../../public/index.html'));
+  // CORS setup 
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
+    next();
   });
 
+  // Routes
   app.get('/api/lobbies', (_req, res) => {
     res.json(matchmaker.list().map((l) => ({
       id:          l.id,

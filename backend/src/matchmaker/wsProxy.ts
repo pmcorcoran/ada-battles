@@ -8,10 +8,24 @@ import type { Server as HttpServer } from 'http';
 import httpProxy from 'http-proxy';
 import type { Matchmaker } from './Matchmaker';
 
-export function attachWsProxy(server: HttpServer, matchmaker: Matchmaker): void {
+export function attachWsProxy(
+  server: HttpServer,
+  matchmaker: Matchmaker,
+  allowedOrigins: string[],
+): void {
   const proxy = httpProxy.createProxyServer({ ws: true });
 
   server.on('upgrade', (req, socket, head) => {
+    // Origin check (defense-in-depth; the runner's wallet-signature
+    // auth is the real gate). Browser requests carry an Origin header;
+    // non-browser clients (none) are let through. If an allow-list is
+    // configured, reject browser origins not on it.
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
+      socket.destroy();
+      return;
+    }
+
     const url = new URL(req.url ?? '/', 'http://placeholder');
     const m = url.pathname.match(/^\/lobby\/([^/]+)$/);
     if (!m) { socket.destroy(); return; }
