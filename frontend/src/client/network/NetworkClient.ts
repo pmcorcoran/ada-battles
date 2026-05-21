@@ -120,10 +120,6 @@ export class NetworkClient {
     this.send('request-start', undefined);
   }
 
-  requestRestart(): void {
-    this.send('request-restart', undefined);
-  }
-
   sendInput(keys: number, rotation: number): void {
     this.send('player-input', { keys, rotation });
   }

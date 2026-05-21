@@ -15,21 +15,20 @@ WORKDIR /app
 # manifests change rarely; source changes constantly. Copy manifests
 # first, install, then copy source.
 COPY backend/package.json backend/package-lock.json* ./backend/
-COPY frontend/package.json frontend/package-lock.json* ./frontend/
+#COPY frontend/package.json frontend/package-lock.json* ./frontend/
 
 RUN cd backend  && npm ci
-RUN cd frontend && npm ci
+#RUN cd frontend && npm ci
 
-# Source. shared/ is consumed by both sides via the @shared/* path
-# alias in each tsconfig.
+# Source. shared/ is consumed by both sides 
 COPY shared/   ./shared/
 COPY backend/  ./backend/
-COPY frontend/ ./frontend/
+#COPY frontend/ ./frontend/
 
 # Build server (TSC → backend/dist/) and client bundle
 # (esbuild → frontend/public/bundle.js).
 RUN cd backend  && npm run build
-RUN cd frontend && npm run build
+#RUN cd frontend && npm run build
 
 # Prune dev deps so the runtime layer copies a slim node_modules.
 # Only the backend's node_modules ships — the frontend's deps are
@@ -67,7 +66,7 @@ WORKDIR /app
 # DockerOrchestrator must change in lockstep.
 COPY --from=build --chown=app:app /app/backend/node_modules    ./node_modules
 COPY --from=build --chown=app:app /app/backend/dist            ./dist
-COPY --from=build --chown=app:app /app/frontend/public         ./public
+#COPY --from=build --chown=app:app /app/frontend/public         ./public
 
 # Either service listens on $PORT; matchmaker defaults to 8080, runner
 # to 3000, but both honour the env var. We don't EXPOSE here — the

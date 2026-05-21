@@ -19,9 +19,8 @@ services:
   matchmaker:
     image: ada-battles:latest
     build:
-      # Context is the repo root so the Dockerfile can see backend/,
-      # frontend/, and shared/ as siblings. Pre-refactor this was
-      # ./frontend; if you have stale build caches, prune them.
+      # Context is the repo root so the Dockerfile can see backend/
+      # and shared/ as siblings. 
       context: .
       dockerfile: Dockerfile
       args:
@@ -35,6 +34,7 @@ services:
       RUNNER_NETWORK:   "ada-battles-net"
       PUBLIC_WS_HOST:   "localhost"
       AUTH_SECRET:      "${AUTH_SECRET}"
+      ALLOWED_ORIGINS:  "http://localhost:3000"
 
       # ── Hydra sidecar config (slice 1: offline mode) ──
       # Pin the hydra-node image. Bump deliberately — API events

@@ -33,9 +33,18 @@ const matchmaker   = new Matchmaker(
   (id) => `ws://${PUBLIC_WS_HOST}:${PUBLIC_PORT}/lobby/${id}`,
 );
 
-const app    = createApp(matchmaker, AUTH_SECRET);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+if (ALLOWED_ORIGINS.length === 0) {
+  console.warn('ALLOWED_ORIGINS not set — CORS/WS origin checks disabled');
+}
+
+const app    = createApp(matchmaker, AUTH_SECRET, ALLOWED_ORIGINS);
 const server = http.createServer(app);
-attachWsProxy(server, matchmaker);
+attachWsProxy(server, matchmaker, ALLOWED_ORIGINS);
 
 setInterval(() => { void matchmaker.reap(); }, 10_000);
 
