@@ -10,11 +10,22 @@
 import type {
   ServerToClientEvents,
   ClientToServerEvents,
-} from '../../shared/types';
-import { encode as wireEncode, decode as wireDecode } from '../../shared/wire';
+} from '../../../../shared/types';
+import { encode as wireEncode, decode as wireDecode } from '../../../../shared/wire';
+import type { WalletSession } from '../wallet/walletAuth';
+import { signChallenge } from '../wallet/walletAuth';
 
 type SingleArg<F> = F extends (arg: infer A) => any ? A : never;
 type Fn<F> = F extends (...args: any[]) => any ? F : never;
+
+
+/** Where the matchmaker API lives. Defaults to same-origin (the
+ *  matchmaker also serves the client bundle). For split deployments
+ *  set `window.MATCHMAKER_URL` in index.html before bundle.js loads. */
+const MATCHMAKER_URL =
+  (window as unknown as { MATCHMAKER_URL?: string }).MATCHMAKER_URL ??
+  location.origin;
+
 
 export class NetworkClient {
   private readonly ws: WebSocket;
@@ -28,9 +39,62 @@ export class NetworkClient {
   /** The lobby room we've been assigned to. */
   lobbyId = '';
 
-  constructor() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.ws = new WebSocket(`${proto}//${location.host}/`);
+
+  static async match(maxPlayers: number, wallet: WalletSession): Promise<NetworkClient> {
+    const res = await fetch(`${MATCHMAKER_URL}/api/lobbies/match`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ maxPlayers }),
+    });
+
+    if (!res.ok) throw new Error(`matchmaker rejected: ${res.status}`);
+    const { lobbyId, wsUrl, challenge } = await res.json() as {
+      lobbyId:   string;
+      wsUrl:     string;
+      challenge: string;
+    };
+
+    const signature = await signChallenge(wallet, challenge);
+
+    const params = new URLSearchParams({
+      address:   wallet.addressHex,
+      challenge,
+      sig:       JSON.stringify(signature),
+    });
+    const authedUrl = `${wsUrl}?${params.toString()}`;
+
+    const net = new NetworkClient(authedUrl);
+    net.lobbyId = lobbyId;
+    return net;
+  }
+
+
+  static async spectate(lobbyId: string, wallet: WalletSession,): Promise<NetworkClient> {
+  // Spectators sign too — they're consuming runner CPU. If you want
+  // anonymous spectate, add a `?spectate=true` branch in the runner
+  // that skips the signature check and grants read-only access.
+  const res = await fetch(`${MATCHMAKER_URL}/api/lobbies/${encodeURIComponent(lobbyId)}`);
+  if (!res.ok) throw new Error(`lobby not found: ${res.status}`);
+  const { wsUrl, challenge } = await res.json() as { wsUrl: string; challenge: string };
+  const signature = await signChallenge(wallet, challenge);
+  const params = new URLSearchParams({
+    address:   wallet.addressHex,
+    challenge,
+    sig:       JSON.stringify(signature),
+  });
+  const net = new NetworkClient(`${wsUrl}?${params.toString()}`);
+  net.lobbyId = lobbyId;
+  return net;
+}
+
+  /**
+   * Direct constructor. Prefer `match()` or `spectate()` — those
+   * resolve the URL through the matchmaker first. This is exposed
+   * mainly for tests and for advanced use cases that already know
+   * the runner URL.
+   */
+  constructor(wsUrl: string) {
+    this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.addEventListener('open', () => {
@@ -44,6 +108,7 @@ export class NetworkClient {
       const msg = wireDecode(new Uint8Array(ev.data));
       if (!msg) return;
       const arr = this.listeners.get(msg.event);
+      console.log('[net] recv', msg.event, 'handlers:', arr?.length ?? 0);  // ← add this
       if (!arr) return;
       for (const h of arr) h(msg.data);
     });
@@ -51,20 +116,8 @@ export class NetworkClient {
 
   //  Outbound 
 
-  joinLobby(size: number): void {
-    this.send('join-lobby', size);
-  }
-
-  joinSpectate(lobbyId: string): void {
-    this.send('join-spectate', lobbyId);
-  }
-
   requestStart(): void {
     this.send('request-start', undefined);
-  }
-
-  requestRestart(): void {
-    this.send('request-restart', undefined);
   }
 
   sendInput(keys: number, rotation: number): void {

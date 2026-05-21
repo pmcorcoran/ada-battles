@@ -3,8 +3,8 @@
  *
  * Thin typed wrapper around the `ws` library that mirrors just enough of the
  * socket.io API to let `app.ts`, `Lobby.ts`, and `LobbyManager.ts` treat the
- * transport as: per-connection sockets with `.id`, `.on`, `.emit`, `.join`,
- * `.leave`, plus a room-broadcast helper `hub.to(room).emit(event, data)`.
+ * transport as: per-connection sockets with `.id`, `.url`, `.on`, `.emit`,
+ * `.join`, `.leave`, plus a room-broadcast helper `hub.to(room).emit(event, data)`.
  *
  * Wire format is the binary codec defined in `src/shared/wire.ts`: a 1-byte
  * opcode followed by a packed payload, sent as a WebSocket binary frame.
@@ -14,7 +14,7 @@ import { randomUUID } from 'crypto';
 import type { Server as HttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
-import { encode as wireEncode, decode as wireDecode } from '../shared/wire';
+import { encode as wireEncode, decode as wireDecode } from '../../shared/wire';
 
 type SingleArg<F> = F extends (arg: infer A) => any ? A : never;
 type Fn<F> = F extends (...args: any[]) => any ? F : never;
@@ -29,7 +29,10 @@ export class WebSocketHub<C2S, S2C> {
 
   constructor(httpServer: HttpServer) {
     this.wss = new WebSocketServer({ server: httpServer });
-    this.wss.on('connection', (ws) => this.handleConnection(ws));
+    // The second arg is the original HTTP upgrade request; we keep its
+    // URL so per-socket auth (challenge + signature in the query string)
+    // can be evaluated by callers in the 'connection' listener.
+    this.wss.on('connection', (ws, req) => this.handleConnection(ws, req.url ?? '/'));
   }
 
   /** Mirrors `io.on('connection', …)`. Only one listener is supported. */
@@ -72,9 +75,9 @@ export class WebSocketHub<C2S, S2C> {
 
   //  Connection handling 
 
-  private handleConnection(ws: WebSocket): void {
+  private handleConnection(ws: WebSocket, url: string): void {
     const id = randomUUID();
-    const socket = new HubSocket<C2S, S2C>(id, ws, this);
+    const socket = new HubSocket<C2S, S2C>(id, ws, this, url);
     this.sockets.set(id, socket);
 
     ws.on('message', (raw) => {
@@ -113,10 +116,14 @@ export class HubSocket<C2S, S2C> {
     public readonly id: string,
     private readonly ws: WebSocket,
     private readonly hub: WebSocketHub<C2S, S2C>,
+    /** The path + query string from the original WS upgrade request.
+     *  e.g. "/?address=01abcd…&challenge=…&sig=…". Use this for per-
+     *  socket auth checks before letting the player join the lobby. */
+    public readonly url: string,
   ) {}
 
-  on<K extends keyof C2S & string>(event: K, handler: Fn<C2S[K]>): void;
   on(event: 'disconnect', handler: () => void): void;
+  on<K extends keyof C2S & string>(event: K, handler: Fn<C2S[K]>): void;
   on(event: string, handler: (data: any) => void): void {
     let arr = this.listeners.get(event);
     if (!arr) {

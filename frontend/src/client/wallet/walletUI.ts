@@ -6,7 +6,7 @@
  */
 
 import { getInstalledWallets } from './cip30';
-import { authenticateWithWallet, type AuthResult } from './walletAuth';
+import { connectWallet, type WalletSession } from './walletAuth';
 
 export interface WalletUIElements {
   connectBtn: HTMLButtonElement;
@@ -16,7 +16,7 @@ export interface WalletUIElements {
 
 export function initWalletUI(
   els: WalletUIElements,
-  onConnected: (result: AuthResult) => void,
+  onConnected: (result: WalletSession) => void,
 ): void {
   let connected = false;
 
@@ -48,7 +48,7 @@ export function initWalletUI(
   ): Promise<void> {
     els.walletList.style.display = 'none';
     try {
-      const result = await authenticateWithWallet(info);
+      const result = await connectWallet(info);
       connected = true;
 
       els.connectBtn.textContent = 'Connected';
