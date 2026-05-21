@@ -5,8 +5,15 @@ This directory holds the Plutus V3 spending validators (compiled with opshin)
 and the shared types/constants they share with the off-chain TypeScript build.
 
 This README is the source of truth for *why* the contracts are shaped the way
-they are. The decisions below were made deliberately; several reverse earlier
+they are — the **legality layer** (which game-state transitions are valid). On
+that layer, the decisions below were made deliberately; several reverse earlier
 assumptions in `HANDOFF.md`, and where they do, this document wins.
+
+It is **not** the source of truth for the **settlement layer** (the Hydra Head
+signing topology, snapshot signing, and close/fanout). That is owned by
+`HANDOFF.md` ("The big decision") and `ARCHITECTURE.md`; §1 summarises it only to
+situate the validators, and on any settlement conflict, `HANDOFF.md` wins. See §1
+for why the two layers are independent.
 
 ---
 
@@ -20,22 +27,58 @@ PvP game.
 
 What Hydra Doom actually does: each player's browser submits state-transition
 transactions to a Hydra Head, and an on-chain validator (the contract) checks
-that the transition is legal. Players are not the Head's signing set — they
-submit transactions against a script, and the contract is the referee. Doom got
+that the transition is legal. The *legality* of a transition does not depend on
+who signs the Head's snapshots — the contract is the referee either way. Doom got
 away with a thin model because it is single-player: the only "opponent" is
 deterministic game AI that cannot lie.
 
 Ada Battles is PvP, so we adopt **Model B (contract-enforced)** but have to do
 more work than Doom, because two humans can each benefit from misrepresenting
-shared state. The model:
+shared state.
 
-- The Head is server-hosted infrastructure (the runner + its hydra-node
-  sidecar). Players are browser clients that submit transactions to the Head.
-- Correctness is enforced by the **validators in this directory**, not by
-  player signatures and not by the runner's authority.
-- The runner is a non-authoritative sequencer: it builds/relays transactions
-  and orders contention, but it cannot forge game state, because the validators
-  reject illegal transitions regardless of who submits them.
+### Two separate guarantees: legality and settlement
+
+The model rests on two guarantees that are easy to conflate but must be kept
+apart, because they are enforced by different mechanisms:
+
+- **Legality — *which transitions were ever valid*.** Enforced by the
+  **validators in this directory**, not by player signatures and not by the
+  runner's authority. Each game-state transition is a transaction the validator
+  checks; illegal transitions are rejected on submission, regardless of who
+  submits them. This is the layer this README is mostly about.
+- **Settlement — *which final state lands on L1*.** Enforced by the Hydra Head's
+  snapshot-signing topology, *not* by the validators. A snapshot is final only
+  when every Head participant has co-signed it.
+
+The two are independent. The validators do not know or care how snapshots are
+signed; the signing topology does not know or care what the validators check. A
+transition can be legal but never settled (no one signs the snapshot carrying
+it), and the settlement layer can carry home only states the validators already
+deemed legal. **This README owns the legality layer.** The settlement layer is
+specified in `HANDOFF.md` ("The big decision") and `ARCHITECTURE.md`; the summary
+below is a pointer, not the source of truth — keep it in sync with `HANDOFF.md`.
+
+### The Head topology (settlement layer — see `HANDOFF.md`)
+
+- The Head is **(N+1)-of-(N+1)**: one server-hosted managed `hydra-node` per
+  player, plus the runner's own node as the +1. Every node co-signs L2
+  snapshots, so no single party — the runner included — can force the final
+  fanned-out state. This is a deliberate **trustless settlement** choice over the
+  simpler "runner is sole signer" model.
+- **Players hold their own Hydra signing key in the browser** and sign snapshots
+  via remote-signing (Option A in `HANDOFF.md`): their managed node does the
+  gossip, ledger view, and L1 ops but never holds the player's key. The node can
+  stall but cannot forge a player's signature.
+- The **runner holds the +1 key** and is a non-authoritative sequencer: it
+  builds/relays transactions and orders contention, and on the settlement side it
+  drives **close/fanout liveness** (browsers disconnect and rage-quit, so the
+  runner is the dependable party that drives Close, watches for a bad Close,
+  Contests with the correct latest snapshot, and Fanouts). It is **not** a
+  tiebreaker — Hydra has no majority/tiebreak; a snapshot is either unanimously
+  signed (final) or it was never a snapshot.
+- Crucially, the runner **cannot forge game state** even though it holds a key,
+  because the validators reject illegal transitions regardless of who submits
+  them. Its key buys settlement liveness, not legality authority.
 
 ### What a passive validator can and cannot catch
 
@@ -278,7 +321,11 @@ To still do:
 - The off-chain `refereeTxBuilder.ts`, which must build these exact multi-UTxO
   transactions (spend + reference sets per transition) and quantise to the same
   integer grid.
-- Resolve whether the runner is a non-signing sequencer or holds a key; this
-  README assumes a non-authoritative sequencer that cannot forge state because
-  the validators reject illegal transitions regardless of submitter.
+- The runner-key question is **resolved** (see §1 and `HANDOFF.md`): the runner
+  holds the +1 key in an **(N+1)-of-(N+1)** Head and drives close/fanout
+  liveness, but is a non-authoritative sequencer that cannot forge state because
+  the validators reject illegal transitions regardless of submitter. Nothing in
+  the validators depends on this — legality enforcement is signing-topology
+  agnostic — but the off-chain tx builder and the close/fanout wiring do, so it
+  is recorded here for the off-chain build.
 ```
