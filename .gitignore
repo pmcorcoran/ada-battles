@@ -16,3 +16,4 @@ HANDOFF.md
 infra/hydra-dev-keys/*
 ARCHITECTURE2.md
 contracts/hydra_referee2.py
+shared/*.js
