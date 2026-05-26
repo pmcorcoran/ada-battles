@@ -14,6 +14,7 @@ import type {
 import { encode as wireEncode, decode as wireDecode } from '../../../../shared/wire';
 import type { WalletSession } from '../wallet/walletAuth';
 import { signChallenge } from '../wallet/walletAuth';
+import { generateHydraKey, type HydraKeypair } from '../hydra/hydraKey';
 
 type SingleArg<F> = F extends (arg: infer A) => any ? A : never;
 type Fn<F> = F extends (...args: any[]) => any ? F : never;
@@ -39,6 +40,9 @@ export class NetworkClient {
   /** The lobby room we've been assigned to. */
   lobbyId = '';
 
+  // This player's Hydra keypair, generated at match() time.
+  hydraKey: HydraKeypair | null = null;
+
 
   static async match(maxPlayers: number, wallet: WalletSession): Promise<NetworkClient> {
     const res = await fetch(`${MATCHMAKER_URL}/api/lobbies/match`, {
@@ -56,15 +60,19 @@ export class NetworkClient {
 
     const signature = await signChallenge(wallet, challenge);
 
+    const hydraKey = await generateHydraKey();
+
     const params = new URLSearchParams({
       address:   wallet.addressHex,
       challenge,
       sig:       JSON.stringify(signature),
+      hydraVk:   hydraKey.vkEnvelope,
     });
     const authedUrl = `${wsUrl}?${params.toString()}`;
 
     const net = new NetworkClient(authedUrl);
     net.lobbyId = lobbyId;
+    net.hydraKey = hydraKey;
     return net;
   }
 

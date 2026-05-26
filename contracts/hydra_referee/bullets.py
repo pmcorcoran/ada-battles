@@ -23,7 +23,7 @@ Entry point is `validator`.
 """
 
 from opshin.prelude import *
-from .shared import *
+from hydra_referee.shared import *
 
 
 def validator(context: ScriptContext) -> None:

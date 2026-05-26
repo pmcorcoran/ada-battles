@@ -37,6 +37,7 @@ export interface ServerPlayer {
   eliminatedBy: string | null;
   canBeRevived: boolean;
   lastShotAtMs: number;
+  hydraVk: string;
 }
 
 export interface ServerBullet {
@@ -106,7 +107,7 @@ export class Lobby {
 
   //  Player management 
 
-  addPlayer(id: string): ServerPlayer {
+  addPlayer(id: string, hydraVk = ''): ServerPlayer {
     const slot = this.allocateSlot();
     const player: ServerPlayer = {
       id,
@@ -119,10 +120,17 @@ export class Lobby {
       eliminatedBy: null,
       canBeRevived: false,
       lastShotAtMs: Number.NEGATIVE_INFINITY,
+      hydraVk,
     };
     this.players.set(id, player);
     this.hasHadPlayers = true;
     return player;
+  }
+
+  hydraRoster(): string[] {
+    return [...this.players.values()]
+    .sort((a, b) => a.slot - b.slot)
+    .map((p) => p.hydraVk);
   }
 
   removePlayer(id: string): void {

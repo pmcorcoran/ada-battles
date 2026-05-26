@@ -133,7 +133,12 @@ hub.on('connection', (socket) => {
   // Auto-join on connect. The matchmaker has already vetted the size.
   if (lobby.players.size < MAX_PLAYERS && lobby.status === 'lobby') {
     socket.join(LOBBY_ID);
-    player = lobby.addPlayer(socket.id);
+    // The player's own Hydra vk rides the same upgrade URL as the auth
+    // params. It's been through verifyWalletChallenge already (the
+    // connection wouldn't be here otherwise); the vk itself isn't part
+    // of auth, just participant identity, so parse it leniently.
+    const hydraVk = parseHydraVk(socket.url);
+    player = lobby.addPlayer(socket.id, hydraVk);
     socket.emit('player-id', player.slot);
     socket.emit('joined-matched-lobby', LOBBY_ID);
     hub.to(LOBBY_ID).emit('player-joined', {
@@ -141,8 +146,15 @@ hub.on('connection', (socket) => {
       playerCount: lobby.players.size,
       lobbyId:     LOBBY_ID,
     });
-    if (lobby.players.size >= MAX_PLAYERS) lobby.startCountdown();
-    else lobby.broadcastState();
+    if (lobby.players.size >= MAX_PLAYERS) {
+      // Lobby is full: this is the keys→roster→Head edge. Seed the Head
+      // with the collected player vks BEFORE the countdown starts.
+      // Offline/slice-1: non-authoritative, logged, gameplay-independent.
+      hydraObserver?.initHead(lobby.hydraRoster());
+      lobby.startCountdown();
+    } else {
+      lobby.broadcastState();
+    }
     trackOccupancy();
   } else {
     // Spectator: full lobby or match already started.
@@ -155,6 +167,9 @@ hub.on('connection', (socket) => {
 
   socket.on('request-start', () => {
     if (lobby.status === 'lobby' && lobby.players.size >= MAX_PLAYERS) {
+      // Same Head-seed edge as auto-fill above: only fires the transition
+      // lobby → countdown, and only once (startCountdown guards on status).
+      hydraObserver?.initHead(lobby.hydraRoster());
       lobby.startCountdown();
     }
   });
@@ -238,4 +253,20 @@ function parseIntStrict(s: string): number {
     process.exit(2);
   }
   return n;
+}
+
+/**
+ * Pull the player's Hydra vk envelope off the WS upgrade URL. Leniently
+ * — the vk is participant identity, not auth (auth already passed to
+ * reach this point), so a missing or malformed vk yields '' rather than
+ * rejecting the connection. The roster tolerates empty slots and logs
+ * them; offline/slice-1 doesn't depend on the vk being present.
+ */
+function parseHydraVk(socketUrl: string): string {
+  try {
+    const parsed = new URL(socketUrl, 'http://placeholder');
+    return parsed.searchParams.get('hydraVk') ?? '';
+  } catch {
+    return '';
+  }
 }
