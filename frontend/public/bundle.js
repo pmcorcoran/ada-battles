@@ -460,6 +460,40 @@
     return sig;
   }
 
+  // src/client/hydra/hydraKey.ts
+  var HYDRA_VK_ENVELOPE_TYPE = "HydraVerificationKey_ed25519";
+  var CBOR_BYTESTRING_32 = "5820";
+  async function generateHydraKey() {
+    let pair;
+    try {
+      pair = await crypto.subtle.generateKey(
+        { name: "Ed25519" },
+        true,
+        ["sign", "verify"]
+      );
+    } catch (err) {
+      throw new Error(
+        `Hydra key generation failed (Ed25519 unsupported in this browser?): ${err.message}`
+      );
+    }
+    const rawVk = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+    if (rawVk.length !== 32) {
+      throw new Error(`unexpected Ed25519 vk length ${rawVk.length}, expected 32`);
+    }
+    const vkHex = toHex(rawVk);
+    const vkEnvelope = JSON.stringify({
+      type: HYDRA_VK_ENVELOPE_TYPE,
+      description: "",
+      cborHex: CBOR_BYTESTRING_32 + vkHex
+    });
+    return { vkHex, vkEnvelope, privateKey: pair.privateKey };
+  }
+  function toHex(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, "0");
+    return s;
+  }
+
   // src/client/network/NetworkClient.ts
   var MATCHMAKER_URL = window.MATCHMAKER_URL ?? location.origin;
   var NetworkClient = class _NetworkClient {
@@ -477,6 +511,8 @@
       this.localSlot = -1;
       /** The lobby room we've been assigned to. */
       this.lobbyId = "";
+      // This player's Hydra keypair, generated at match() time.
+      this.hydraKey = null;
       this.ws = new WebSocket(wsUrl);
       this.ws.binaryType = "arraybuffer";
       this.ws.addEventListener("open", () => {
@@ -503,14 +539,17 @@
       if (!res.ok) throw new Error(`matchmaker rejected: ${res.status}`);
       const { lobbyId, wsUrl, challenge } = await res.json();
       const signature = await signChallenge(wallet, challenge);
+      const hydraKey = await generateHydraKey();
       const params = new URLSearchParams({
         address: wallet.addressHex,
         challenge,
-        sig: JSON.stringify(signature)
+        sig: JSON.stringify(signature),
+        hydraVk: hydraKey.vkEnvelope
       });
       const authedUrl = `${wsUrl}?${params.toString()}`;
       const net = new _NetworkClient(authedUrl);
       net.lobbyId = lobbyId;
+      net.hydraKey = hydraKey;
       return net;
     }
     static async spectate(lobbyId, wallet) {

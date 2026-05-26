@@ -15,5 +15,5 @@
     "sourceMap": true
   },
   "include": ["src/**/*", "../shared/**/*"],
-  "exclude": ["node_modules", "dist", "public"]
+  "exclude": ["node_modules", "dist", "public", "../shared/authChallenge.ts", "../shared/wire.check.ts"]
 }

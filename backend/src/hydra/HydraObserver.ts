@@ -30,6 +30,9 @@ export class HydraObserver {
   private client: HydraSidecarClient;
   private _status: HydraStatus = 'connecting';
   private connected = false;
+  /** Ensures the Head is seeded at most once per lobby, even if both the
+   *  auto-fill and explicit request-start paths reach the edge. */
+  private headSeeded = false;
 
   constructor(private readonly opts: HydraObserverOptions) {
     this.client = new HydraSidecarClient({
@@ -73,6 +76,55 @@ export class HydraObserver {
   async stop(): Promise<void> {
     this.log('stopping observer');
     await this.client.close();
+  }
+
+  /**
+   * Seed the Head with the player-derived participant set when the lobby
+   * fills. This is the keys→roster→Head step.
+   *
+   * Offline/slice-1 reality: the participant set of an offline head is
+   * fixed by the node's own flags (--offline-head-seed + the single
+   * --hydra-signing-key), and `Init` is fundamentally an L1 action. So
+   * the collected vks cannot yet *become* the on-chain participants of
+   * this offline sidecar — that needs online mode and one node per key
+   * (the deferred Option-A topology). What this method does today:
+   *
+   *   1. Log the assembled roster of player vks (the real deliverable —
+   *      it proves keys flowed browser → upgrade URL → runner → here).
+   *   2. Best-effort send `{ tag: 'Init' }` so the lifecycle wiring
+   *      (send → HydraObserver reduction) is exercised end to end. In
+   *      offline mode this may be a no-op or surface CommandFailed;
+   *      either is logged and NON-fatal, consistent with slice-1's
+   *      non-authoritative stance. No gameplay depends on the result.
+   *
+   * Slice-2 swap point: when per-player online nodes land, this method's
+   * body becomes "configure peers from `roster`, then Init", and the
+   * roster stops being merely logged.
+   */
+  initHead(roster: string[]): void {
+    if (this.headSeeded) return;
+    this.headSeeded = true;
+    const present = roster.filter((vk) => vk.length > 0).length;
+    this.log(
+      `lobby full — seeding Head with ${present}/${roster.length} player vk(s)`,
+    );
+    roster.forEach((vk, slot) => {
+      this.log(`  slot ${slot}: ${vk ? summariseVk(vk) : '<no vk presented>'}`);
+    });
+
+    if (!this.connected) {
+      this.log('sidecar not connected; skipping Init (non-authoritative)');
+      return;
+    }
+    try {
+      // Reserved client command path from slice 1. Offline nodes may
+      // reject this; handleOutput logs CommandFailed/PostTxOnChainFailed
+      // as a warning without changing state.
+      this.client.send({ tag: 'Init' });
+      this.log('sent Init to sidecar (offline: may no-op or fail; non-fatal)');
+    } catch (err) {
+      this.log(`Init send failed (non-fatal): ${(err as Error).message}`);
+    }
   }
 
   // ── event reduction ────────────────────────────────────────────
@@ -140,6 +192,22 @@ export class HydraObserver {
 
 function shortId(uuid: string): string {
   return uuid.slice(0, 8);
+}
+
+/** Pull a short, log-friendly fingerprint out of a vk envelope without
+ *  dumping the whole JSON. Falls back to a length note if the shape is
+ *  unexpected — we never throw from a logging helper. */
+function summariseVk(vkEnvelope: string): string {
+  try {
+    const parsed = JSON.parse(vkEnvelope) as { cborHex?: string };
+    const hex = parsed.cborHex ?? '';
+    // Strip the 5820 CBOR prefix if present; show first/last 6 hex chars.
+    const body = hex.startsWith('5820') ? hex.slice(4) : hex;
+    if (body.length >= 12) return `${body.slice(0, 6)}…${body.slice(-6)}`;
+    return body || '<empty cborHex>';
+  } catch {
+    return `<unparseable vk, ${vkEnvelope.length} chars>`;
+  }
 }
 
 function mapHeadStatus(raw: string | undefined, fallback: HydraStatus): HydraStatus {
