@@ -15,3 +15,8 @@ package-lock.json
 infra/hydra-dev-keys/*
 shared/*.js
 mydocs/
+*.vk
+*.sk
+*.vkey
+*.skey
+infra/hydra-preprod/*-tx-*.json
