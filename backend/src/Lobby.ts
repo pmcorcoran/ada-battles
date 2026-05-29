@@ -38,6 +38,7 @@ export interface ServerPlayer {
   canBeRevived: boolean;
   lastShotAtMs: number;
   hydraVk: string;
+  pubKeyHash: string;
 }
 
 export interface ServerBullet {
@@ -107,7 +108,7 @@ export class Lobby {
 
   //  Player management 
 
-  addPlayer(id: string, hydraVk = ''): ServerPlayer {
+  addPlayer(id: string, hydraVk = '', pubKeyHash = '',): ServerPlayer {
     const slot = this.allocateSlot();
     const player: ServerPlayer = {
       id,
@@ -121,6 +122,7 @@ export class Lobby {
       canBeRevived: false,
       lastShotAtMs: Number.NEGATIVE_INFINITY,
       hydraVk,
+      pubKeyHash,
     };
     this.players.set(id, player);
     this.hasHadPlayers = true;

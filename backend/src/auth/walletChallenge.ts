@@ -15,6 +15,7 @@ import { verifyChallenge } from '../../../shared/authChallenge';
 
 export interface AuthResult {
   addressHex: string;
+  pubKeyHash: string;
 }
 
 /**
@@ -65,7 +66,10 @@ export function verifyWalletChallenge(
   );
   if (!ok) return null;
 
-  return { addressHex: address };
+  const pubKeyHash = pubKeyHashFromAddress(address);
+  if (!pubKeyHash) return null;   // script-based payment cred — can't addSignerKey
+
+  return { addressHex: address, pubKeyHash };
 }
 
 function hexAddressToBech32(hex: string): string {
@@ -74,4 +78,13 @@ function hexAddressToBech32(hex: string): string {
   const prefix = networkId === 1 ? 'addr' : 'addr_test';
   const words = bech32.toWords(bytes);
   return bech32.encode(prefix, words, 1000);
+}
+
+function pubKeyHashFromAddress(hex: string): string | null {
+  const bytes = Buffer.from(hex, 'hex');
+  if (bytes.length < 29) return null;
+  const type = (bytes[0] >> 4) & 0x0f;
+  if (type & 0x01) return null;   // 1,3,5,7 = script payment cred
+  if (type >= 8)   return null;   // 8 = Byron, 14/15 = reward
+  return bytes.slice(1, 29).toString('hex');
 }
