@@ -11,5 +11,5 @@
     "rootDir": ".."
   },
   "include": ["src/**/*", "../shared/**/*"],
-  "exclude": ["../shared/**/*.check.ts"]
+  "exclude": ["../shared/**/*.check.ts", "src/tx-builder/**/*"]
 }

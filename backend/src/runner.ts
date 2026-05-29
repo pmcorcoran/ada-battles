@@ -138,7 +138,7 @@ hub.on('connection', (socket) => {
     // connection wouldn't be here otherwise); the vk itself isn't part
     // of auth, just participant identity, so parse it leniently.
     const hydraVk = parseHydraVk(socket.url);
-    player = lobby.addPlayer(socket.id, hydraVk);
+    player = lobby.addPlayer(socket.id, hydraVk, authResult.pubKeyHash);
     socket.emit('player-id', player.slot);
     socket.emit('joined-matched-lobby', LOBBY_ID);
     hub.to(LOBBY_ID).emit('player-joined', {
