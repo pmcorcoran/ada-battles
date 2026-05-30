@@ -42,7 +42,7 @@ export interface BulletDTO {
   rotation: number;
 }
 
-export type LobbyStatus = 'lobby' | 'countdown' | 'playing' | 'ended';
+export type LobbyStatus = 'lobby' | 'opening' | 'countdown' | 'playing' | 'ended';
 
 /** Full lobby snapshot broadcast every tick. */
 export interface LobbyStateDTO {

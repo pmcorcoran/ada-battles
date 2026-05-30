@@ -18,6 +18,7 @@ import {
   drawPlayer,
   drawBullet,
   drawCountdown,
+  drawOpeningHead,  
   drawMenu,
   drawLobby,
   type MenuHitAreas,
@@ -290,6 +291,13 @@ startSpectate(spectateLobby: string): void {
 
     if (this.status === 'menu') {
       this.menuHitAreas = drawMenu(ctx, this.maxPlayers);
+      return;
+    }
+
+    if (this.status === 'opening') {
+      // Lobby is full; we're waiting on HeadIsOpen. Clean dedicated screen,
+      // no entities yet (the game hasn't started).
+      drawOpeningHead(ctx);
       return;
     }
 

@@ -39,6 +39,7 @@ export interface ServerPlayer {
   lastShotAtMs: number;
   hydraVk: string;
   pubKeyHash: string;
+  connected: boolean;
 }
 
 export interface ServerBullet {
@@ -53,6 +54,8 @@ export interface ServerBullet {
   startX: number;
   startY: number;
 }
+
+//const OPENING_HEARTBEAT_MS = 1_000;   // re-announce 'opening' so late/racing clients catch up
 
 //  Spawn positions 
 
@@ -123,6 +126,7 @@ export class Lobby {
       lastShotAtMs: Number.NEGATIVE_INFINITY,
       hydraVk,
       pubKeyHash,
+      connected: true,
     };
     this.players.set(id, player);
     this.hasHadPlayers = true;
@@ -138,19 +142,30 @@ export class Lobby {
   removePlayer(id: string): void {
     const leaving = this.players.get(id);
 
-    this.grantRevivesForKiller(id);
+    if (!leaving) return;
 
-    if (leaving) this.freeSlot(leaving.slot);
+    // After the Head is open (countdown / playing) the roster is locked, so
+    // a disconnect does NOT end or cancel the match. The avatar stays in the
+    // game, stops taking input, and dies by normal game logic. (Damage is
+    // victim-reported today, so until hits become shooter-reported the ghost
+    // is an uncontrolled, undamageable entity — see note in checkWin.)
+    if (this.status === 'countdown' || this.status === 'playing') {
+      leaving.connected = false;
+      leaving.inputKeys = 0;          // freeze in place; no further input arrives
+      this.broadcastState();
+      return;
+    }
+
+    // Pre-open states: the player is fully removed.
+    this.grantRevivesForKiller(id);
+    this.freeSlot(leaving.slot);
     this.players.delete(id);
 
-    // State transitions on player leave:
-    //   playing   → ended  (always; matches are one-shot)
-    //   countdown → lobby  (cancel and wait for more players)
-    //   lobby     → ended  (if we've had players and now empty)
-    if (this.status === 'playing') {
-      this.endMatch();
-    } else if (this.status === 'countdown') {
-      this.cancelCountdown();
+    // State transitions on player leave (pre-open only):
+    //   opening → ended  (Head already seeding on L1; tear the match down)
+    //   lobby   → ended  (had players and now empty)
+    if (this.status === 'opening') {
+       this.endMatch();
     } else if (this.status === 'lobby' && this.players.size === 0 && this.hasHadPlayers) {
       this.endMatch();
     }
@@ -158,6 +173,16 @@ export class Lobby {
 
   get isEmpty(): boolean {
     return this.players.size === 0;
+  }
+
+  /** Players whose socket is still attached. The runner uses this — not
+   *  players.size, which now counts disconnected-but-in-game avatars — to
+   *  decide when the lobby is idle and the process can exit. 
+   */
+  get connectedCount(): number {
+    let n = 0;
+    for (const p of this.players.values()) if (p.connected) n++;
+    return n;
   }
 
   /** Lowest clear bit in the slot bitset. Capped at maxPlayers (size-7). */
@@ -177,8 +202,20 @@ export class Lobby {
 
   //  Countdown 
 
+  /** lobby → opening. The runner calls this once the lobby is full and has
+   *  begun the Head-open handshake; clients show the "Opening Hydra head…"
+   *  screen until startCountdown() (Head open) or teardown (open fails and a
+   *  player leaves, or the runner idle-reaps once empty). */
+  enterOpening(): void {
+  if (this.status !== 'lobby') return;
+  this.status = 'opening';
+  this.broadcastState();
+}
+
   startCountdown(): void {
-    if (this.status !== 'lobby') return;
+    // Entered from 'lobby' (no Hydra sidecar) or from 'opening' (Head open).
+    if (this.status !== 'lobby' && this.status !== 'opening') return;
+    this.status = 'countdown';
 
     this.status = 'countdown';
     this.countdownTime = COUNTDOWN_SECONDS;
@@ -193,14 +230,6 @@ export class Lobby {
         this.startGame();
       }
     }, 1000);
-  }
-
-  /** Cancel an in-progress countdown and return to lobby state. */
-  private cancelCountdown(): void {
-    this.clearCountdown();
-    this.countdownTime = COUNTDOWN_SECONDS;
-    this.status = 'lobby';
-    this.broadcastState();
   }
 
   /** End the match. Terminal — the runner will see this via /status
