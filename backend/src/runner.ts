@@ -64,9 +64,13 @@ app.use(express.json());
 
 const lobby = new Lobby(LOBBY_ID, MAX_PLAYERS, hub);
 
-// ── Hydra observer (slice 1: non-authoritative) ────────────────────
+// ── Hydra observer (now gates game start: see beginWhenHeadOpen) ────
 
 let hydraObserver: HydraObserver | null = null;
+
+// Guard so the Head is opened/awaited at most once per lobby, even if the
+// auto-fill and explicit request-start paths both reach the start edge.
+let awaitingHead = false;
 
 // ── Status / health for the matchmaker ─────────────────────────────
 
@@ -95,7 +99,7 @@ let lastNonEmptyAt = Date.now();
 let emptyShutdownTimer: NodeJS.Timeout | undefined;
 
 function trackOccupancy(): void {
-  const empty = lobby.players.size === 0;
+  const empty = lobby.connectedCount === 0;
   if (!empty) {
     lastNonEmptyAt = Date.now();
     if (emptyShutdownTimer) {
@@ -106,7 +110,7 @@ function trackOccupancy(): void {
   }
   if (emptyShutdownTimer) return;
   emptyShutdownTimer = setTimeout(() => {
-    if (lobby.players.size === 0 && Date.now() - lastNonEmptyAt >= IDLE_SHUTDOWN_MS) {
+    if (lobby.connectedCount === 0 && Date.now() - lastNonEmptyAt >= IDLE_SHUTDOWN_MS) {
       console.log(`[${LOBBY_ID}] idle for ${IDLE_SHUTDOWN_MS}ms, exiting`);
       void shutdown(0);
     }
@@ -147,11 +151,9 @@ hub.on('connection', (socket) => {
       lobbyId:     LOBBY_ID,
     });
     if (lobby.players.size >= MAX_PLAYERS) {
-      // Lobby is full: this is the keys→roster→Head edge. Seed the Head
-      // with the collected player vks BEFORE the countdown starts.
-      // Offline/slice-1: non-authoritative, logged, gameplay-independent.
-      hydraObserver?.initHead(lobby.hydraRoster());
-      lobby.startCountdown();
+      // Lobby is full: open the Head, then start the countdown once it
+      // reaches HeadIsOpen. beginWhenHeadOpen() owns that wait + fallbacks.
+      void beginWhenHeadOpen();
     } else {
       lobby.broadcastState();
     }
@@ -167,10 +169,9 @@ hub.on('connection', (socket) => {
 
   socket.on('request-start', () => {
     if (lobby.status === 'lobby' && lobby.players.size >= MAX_PLAYERS) {
-      // Same Head-seed edge as auto-fill above: only fires the transition
-      // lobby → countdown, and only once (startCountdown guards on status).
-      hydraObserver?.initHead(lobby.hydraRoster());
-      lobby.startCountdown();
+      // Same edge as auto-fill above. beginWhenHeadOpen() is idempotent
+      // (awaitingHead guard), so a manual start during the wait is a no-op.
+      void beginWhenHeadOpen();
     }
   });
 
@@ -185,15 +186,55 @@ hub.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (!player) return;
     const leavingSlot = player.slot;
+     // Capture before removePlayer(): once the Head is open the avatar
+    // persists (ghost), so we DON'T tell clients to drop it — it keeps
+    // rendering and stays a valid target. removePlayer() has already
+    // re-broadcast the state in that case.
+    const postOpen = lobby.status === 'countdown' || lobby.status === 'playing';
+
     lobby.removePlayer(socket.id);
-    hub.to(LOBBY_ID).emit('player-left', {
-      slot:        leavingSlot,
-      playerCount: lobby.players.size,
-      lobbyId:     LOBBY_ID,
-    });
+
+    if (!postOpen) {
+      hub.to(LOBBY_ID).emit('player-left', {
+        slot:        leavingSlot,
+        playerCount: lobby.players.size,
+        lobbyId:     LOBBY_ID,
+      });
+    }
     trackOccupancy();
   });
 });
+
+// ── Head-gated game start ───────────────────────────────────────────
+//
+// Called from both start edges (auto-fill on lobby-full and explicit
+// request-start). Seeds the Head, waits for HeadIsOpen, THEN starts the
+// countdown. Idempotent via the module-level awaitingHead guard.
+
+async function beginWhenHeadOpen(): Promise<void> {
+  if (awaitingHead) return;            // request-start can re-enter while we wait
+  awaitingHead = true;
+
+  // No sidecar configured → no Head to open; go straight to the countdown.
+  if (!hydraObserver) {
+    lobby.startCountdown();
+    return;
+  }
+
+  // Show the "Opening Hydra head…" screen, then seed + wait for HeadIsOpen.
+  lobby.enterOpening();
+  hydraObserver.initHead(lobby.hydraRoster());   // idempotent (headSeeded guard)
+
+  try {
+    await hydraObserver.waitUntilOpen();          // resolves on HeadIsOpen
+    if (lobby.status === 'opening') lobby.startCountdown();
+  } catch (err) {
+    // Hard gate: the Head never opened, so the game does NOT start. The
+    // lobby stays on the "Opening Hydra head…" screen; it's torn down when
+    // a player leaves (opening → ended) and idle-reaped once empty.
+    console.warn(`[${LOBBY_ID}] head did not open: ${(err as Error).message}; not starting`);
+  }
+}
 
 // ── Boot + signal handling ─────────────────────────────────────────
 

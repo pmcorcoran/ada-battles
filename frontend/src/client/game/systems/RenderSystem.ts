@@ -228,3 +228,20 @@ export function drawLobby(
 
   return { startButton: { x: startX, y: 200, w: 150, h: 50 } };
 }
+
+// ── Opening Hydra Head Screen ────────────────────────────────────────────────
+
+export function drawOpeningHead(ctx: CanvasRenderingContext2D): void {
+  ctx.fillStyle = COLORS.WHITE;
+  ctx.font      = 'bold 40px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('Opening Hydra head…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 20);
+
+  ctx.fillStyle = '#aaa';
+  ctx.font      = '18px Arial';
+  ctx.fillText(
+    'Settling the match on-chain — this can take a minute on preprod.',
+    CANVAS_WIDTH / 2,
+    CANVAS_HEIGHT / 2 + 24,
+  );
+}

@@ -48,10 +48,12 @@ const EVENT_BY_OP: Record<number, string> = Object.fromEntries(
   Object.entries(OP).map(([k, v]) => [v, k]),
 );
 
+// NOTE: positional — append new statuses at the END so existing wire
+// values stay stable (lobby=0, countdown=1, playing=2, ended=3, opening=4).
 const STATUS_TO_U8: Record<LobbyStatus, number> = {
-  lobby: 0, countdown: 1, playing: 2, ended: 3,
+  lobby: 0, countdown: 1, playing: 2, ended: 3, opening: 4,
 };
-const U8_TO_STATUS: LobbyStatus[] = ['lobby', 'countdown', 'playing', 'ended'];
+const U8_TO_STATUS: LobbyStatus[] = ['lobby', 'countdown', 'playing', 'ended', 'opening'];
 
 const POS_SCALE = 10;                         // 0.1 px precision
 const TWO_PI    = Math.PI * 2;

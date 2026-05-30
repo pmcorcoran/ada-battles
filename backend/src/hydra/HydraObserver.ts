@@ -181,6 +181,30 @@ private async sendInitialCommit(): Promise<void> {
   }
 }
 
+/**
+ * Resolve when the Head is open. Resolves immediately if already open.
+ * Rejects if the Head hits a terminal/failed state first, or after timeoutMs.
+ * Safe to call multiple times.
+ */
+waitUntilOpen(timeoutMs = 180_000): Promise<void> {
+  if (this._status === 'open') return Promise.resolve();
+
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsub();
+      reject(new Error(`Head did not open within ${timeoutMs}ms (status=${this._status})`));
+    }, timeoutMs);
+
+    const unsub = this.onStatusChange((next) => {
+      if (next === 'open') {
+        clearTimeout(timer); unsub(); resolve();
+      } else if (next === 'closed' || next === 'finalized' || next === 'aborted' || next === 'error') {
+        clearTimeout(timer); unsub(); reject(new Error(`Head reached ${next} before opening`));
+      }
+    });
+  });
+}
+
   /**
  * Drive the Head to a terminal state and resolve when it gets there.
  *
