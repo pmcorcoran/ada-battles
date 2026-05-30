@@ -46,6 +46,7 @@ const MAX_PLAYERS      = parseIntStrict(required('MAX_PLAYERS'));
 const PORT             = Number(process.env.PORT ?? 3000);
 const IDLE_SHUTDOWN_MS = Number(process.env.IDLE_SHUTDOWN_MS ?? 5 * 60_000);
 const HYDRA_SIDECAR_URL = process.env.HYDRA_SIDECAR_URL; // optional in slice 1
+const MIN_OPENING_MS   = 2_500;
 
 if (MAX_PLAYERS < 3 || MAX_PLAYERS > 5) {
   console.error(`MAX_PLAYERS=${MAX_PLAYERS} out of range [3, 5]`);
@@ -234,6 +235,10 @@ async function beginWhenHeadOpen(): Promise<void> {
     // a player leaves (opening → ended) and idle-reaped once empty.
     console.warn(`[${LOBBY_ID}] head did not open: ${(err as Error).message}; not starting`);
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── Boot + signal handling ─────────────────────────────────────────

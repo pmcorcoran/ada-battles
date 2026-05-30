@@ -55,6 +55,8 @@ export interface ServerBullet {
   startY: number;
 }
 
+//const OPENING_HEARTBEAT_MS = 1_000;   // re-announce 'opening' so late/racing clients catch up
+
 //  Spawn positions 
 
 const SPAWN_POSITIONS = [
@@ -205,14 +207,15 @@ export class Lobby {
    *  screen until startCountdown() (Head open) or teardown (open fails and a
    *  player leaves, or the runner idle-reaps once empty). */
   enterOpening(): void {
-    if (this.status !== 'lobby') return;
-    this.status = 'opening';
-    this.broadcastState();
-  }
+  if (this.status !== 'lobby') return;
+  this.status = 'opening';
+  this.broadcastState();
+}
 
   startCountdown(): void {
     // Entered from 'lobby' (no Hydra sidecar) or from 'opening' (Head open).
     if (this.status !== 'lobby' && this.status !== 'opening') return;
+    this.status = 'countdown';
 
     this.status = 'countdown';
     this.countdownTime = COUNTDOWN_SECONDS;

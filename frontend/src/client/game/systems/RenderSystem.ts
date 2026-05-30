@@ -109,14 +109,31 @@ export function drawBullet(ctx: CanvasRenderingContext2D, bullet: BulletComponen
 // ── Countdown Overlay ────────────────────────────────────────────────────────
 
 export function drawCountdown(ctx: CanvasRenderingContext2D, seconds: number): void {
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  const cx = CANVAS_WIDTH / 2;
+  const cy = CANVAS_HEIGHT / 2;
+  const t  = performance.now() / 1000;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  ctx.fillStyle    = COLORS.WHITE;
-  ctx.font         = 'bold 120px Arial';
+  ctx.fillStyle    = '#b9c2d0';
+  ctx.font         = 'bold 28px Arial';
   ctx.textAlign    = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(seconds.toString(), CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+  ctx.fillText('Head is open — get ready!', cx, cy - 96);
+
+  // Big number with a per-second "pop".
+  const frac  = t - Math.floor(t);
+  const scale = 1 + 0.18 * (1 - frac);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = COLORS.WHITE;
+  ctx.font      = 'bold 120px Arial';
+  ctx.fillText(Math.max(0, seconds).toString(), 0, 0);
+  ctx.restore();
+
+  ctx.textBaseline = 'alphabetic';
 }
 
 // ── Menu Screen ──────────────────────────────────────────────────────────────
@@ -232,16 +249,56 @@ export function drawLobby(
 // ── Opening Hydra Head Screen ────────────────────────────────────────────────
 
 export function drawOpeningHead(ctx: CanvasRenderingContext2D): void {
-  ctx.fillStyle = COLORS.WHITE;
-  ctx.font      = 'bold 40px Arial';
-  ctx.textAlign = 'center';
-  ctx.fillText('Opening Hydra head…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 20);
+  const cx = CANVAS_WIDTH / 2;
+  const cy = CANVAS_HEIGHT / 2;
+  const t  = performance.now() / 1000;            // seconds, for animation
 
-  ctx.fillStyle = '#aaa';
+  // Dim the field so this clearly reads as a blocking "please wait" overlay.
+  ctx.fillStyle = 'rgba(10, 10, 25, 0.82)';
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  // Title
+  ctx.fillStyle    = COLORS.WHITE;
+  ctx.font         = 'bold 42px Arial';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`Opening Hydra Head`, cx, cy - 13);
+
+  // Subtitle.
+  ctx.fillStyle = '#b9c2d0';
   ctx.font      = '18px Arial';
   ctx.fillText(
-    'Settling the match on-chain — this can take a minute on preprod.',
-    CANVAS_WIDTH / 2,
-    CANVAS_HEIGHT / 2 + 24,
+    'Prepare for battle',
+    cx, cy + 27,
   );
+
+  // Indeterminate progress bar (a chunk that ping-pongs across a track).
+  const barW = 320, barH = 8;
+  const barX = cx - barW / 2, barY = cy + 65, radius = barH / 2;
+  roundRect(ctx, barX, barY, barW, barH, radius);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fill();
+
+  const chunkW = 90;
+  const phase  = (Math.sin(t * 1.6) + 1) / 2;      // 0..1 eased
+  const chunkX = barX + (barW - chunkW) * phase;
+  roundRect(ctx, chunkX, barY, chunkW, barH, radius);
+  ctx.fillStyle = COLORS.SELF;
+  ctx.fill();
+
+  ctx.textBaseline = 'alphabetic';                 // reset for later frames
+}
+
+// Rounded-rect path helper (no native one in older canvas).
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+): void {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
 }

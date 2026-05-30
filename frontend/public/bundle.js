@@ -133,9 +133,10 @@
     lobby: 0,
     countdown: 1,
     playing: 2,
-    ended: 3
+    ended: 3,
+    opening: 4
   };
-  var U8_TO_STATUS = ["lobby", "countdown", "playing", "ended"];
+  var U8_TO_STATUS = ["lobby", "countdown", "playing", "ended", "opening"];
   var POS_SCALE = 10;
   var TWO_PI = Math.PI * 2;
   var ROT_SCALE = 65535 / TWO_PI;
@@ -745,13 +746,26 @@
     ctx.restore();
   }
   function drawCountdown(ctx, seconds) {
-    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+    const cx = CANVAS_WIDTH / 2;
+    const cy = CANVAS_HEIGHT / 2;
+    const t = performance.now() / 1e3;
+    ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    ctx.fillStyle = COLORS.WHITE;
-    ctx.font = "bold 120px Arial";
+    ctx.fillStyle = "#b9c2d0";
+    ctx.font = "bold 28px Arial";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(seconds.toString(), CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+    ctx.fillText("Head is open \u2014 get ready!", cx, cy - 96);
+    const frac = t - Math.floor(t);
+    const scale = 1 + 0.18 * (1 - frac);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = COLORS.WHITE;
+    ctx.font = "bold 120px Arial";
+    ctx.fillText(Math.max(0, seconds).toString(), 0, 0);
+    ctx.restore();
+    ctx.textBaseline = "alphabetic";
   }
   function drawMenu(ctx, selectedSize) {
     const BTN_W = 200;
@@ -822,6 +836,62 @@
       235
     );
     return { startButton: { x: startX, y: 200, w: 150, h: 50 } };
+  }
+  function drawOpeningHead(ctx) {
+    const cx = CANVAS_WIDTH / 2;
+    const cy = CANVAS_HEIGHT / 2;
+    const t = performance.now() / 1e3;
+    ctx.fillStyle = "rgba(10, 10, 25, 0.82)";
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    const r = 26;
+    ctx.save();
+    ctx.translate(cx, cy - 96);
+    ctx.rotate(t * 2.2 % (Math.PI * 2));
+    ctx.lineWidth = 5;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = COLORS.SELF;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 1.35);
+    ctx.stroke();
+    ctx.restore();
+    const dots = ".".repeat(1 + Math.floor(t * 2) % 3);
+    ctx.fillStyle = COLORS.WHITE;
+    ctx.font = "bold 42px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`Opening Hydra Head${dots}`, cx, cy - 6);
+    ctx.fillStyle = "#b9c2d0";
+    ctx.font = "18px Arial";
+    ctx.fillText(
+      "Settling the match on-chain \u2014 this can take a minute on preprod.",
+      cx,
+      cy + 34
+    );
+    const barW = 320, barH = 8;
+    const barX = cx - barW / 2, barY = cy + 72, radius = barH / 2;
+    roundRect(ctx, barX, barY, barW, barH, radius);
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.fill();
+    const chunkW = 90;
+    const phase = (Math.sin(t * 1.6) + 1) / 2;
+    const chunkX = barX + (barW - chunkW) * phase;
+    roundRect(ctx, chunkX, barY, chunkW, barH, radius);
+    ctx.fillStyle = COLORS.SELF;
+    ctx.fill();
+    ctx.textBaseline = "alphabetic";
+  }
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
   }
 
   // src/client/game/systems/HUDSystem.ts
@@ -1114,6 +1184,10 @@
       drawBackground(ctx);
       if (this.status === "menu") {
         this.menuHitAreas = drawMenu(ctx, this.maxPlayers);
+        return;
+      }
+      if (this.status === "opening") {
+        drawOpeningHead(ctx);
         return;
       }
       if (this.status === "lobby") {
