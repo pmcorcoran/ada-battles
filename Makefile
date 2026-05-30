@@ -3,8 +3,8 @@
 # Slice 1 added the hydra-dev-keys target; everything else is for
 # future use.
 
-HYDRA_IMG     ?= ghcr.io/cardano-scaling/hydra-node:1.2.0
-HYDRA_VERSION ?= 1.2.0
+HYDRA_IMG     ?= ghcr.io/cardano-scaling/hydra-node:2.0.0
+HYDRA_VERSION ?= 2.0.0
 # Hydra ships a ready-made zero-fee protocol-parameters.json in its repo
 # (a copy of mainnet params with fees nullified) — exactly what offline
 # mode wants. Pinned to the same tag as the node image.

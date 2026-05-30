@@ -4,7 +4,7 @@ node_modules/
 venv/
 build/
 test-keys/
-.env
+.env*
 .pytest_cache
 __pycache__
 .pytest_cache/

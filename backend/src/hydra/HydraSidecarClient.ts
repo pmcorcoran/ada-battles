@@ -22,10 +22,12 @@
  */
 
 import WebSocket from 'ws';
-import type { HydraServerOutput, HydraClientCommand } from './types';
+import type { HydraServerOutput, HydraClientCommand, HydraStatus} from './types';
 
-const STARTUP_RETRIES = 12;     // 12 × 1s ≈ 12s, comfortable for cold start
-const STARTUP_RETRY_DELAY_MS = 1_000;
+export type StatusHandler = (next: HydraStatus, prev: HydraStatus) => void;
+
+const STARTUP_RETRIES = 30;     // 12 × 1s ≈ 12s, comfortable for cold start
+const STARTUP_RETRY_DELAY_MS = 4_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 
 type OutputHandler = (event: HydraServerOutput) => void;

@@ -220,19 +220,22 @@ process.on('SIGTERM', () => void shutdown(0));
 process.on('SIGINT',  () => void shutdown(0));
 
 async function shutdown(code: number): Promise<void> {
-  // Decision (ii): runner owns sidecar lifecycle. Tear down observer
-  // first so any in-flight Close (slice 2) has a chance to complete
-  // before the HTTP server closes. In slice 1 stop() is essentially
-  // a clean WS close.
+  // Runner owns sidecar lifecycle: close the Head BEFORE tearing down
+  // the WS observer client. closeHead() drives Close → Fanout → Finalized
+  // and resolves on terminal status; stop() then closes the WS cleanly.
   if (hydraObserver) {
+    try { await hydraObserver.closeHead(); } catch (err) {
+      console.warn(`[${LOBBY_ID}] hydra closeHead failed: ${(err as Error).message}`);
+    }
     try { await hydraObserver.stop(); } catch (err) {
       console.warn(`[${LOBBY_ID}] hydra observer stop failed: ${(err as Error).message}`);
     }
   }
-  // Give in-flight WS frames a chance to flush, then exit. Express
-  // closes the http server which cascades to the WS upgrade handler.
+  // Give in-flight WS frames a chance to flush, then exit. The backstop
+  // timeout is generous because a full close+fanout on preprod takes
+  // ~contestation-period + a few L1 blocks (~2-3 minutes with our 60s CP).
   server.close(() => process.exit(code));
-  setTimeout(() => process.exit(code), 2_000).unref();
+  setTimeout(() => process.exit(code), 5 * 60_000).unref();
 }
 
 // ── Utils ──────────────────────────────────────────────────────────

@@ -40,7 +40,7 @@ export interface DockerOrchestratorOptions {
   runnerPort?: number;
 
   /** Image for the hydra-node sidecar.
-   *  Pinned: ghcr.io/cardano-scaling/hydra-node:1.2.0 */
+   *  Pinned: ghcr.io/cardano-scaling/hydra-node:2.0.0 */
   hydraImage: string;
   /** API port inside the sidecar container. */
   hydraApiPort?: number;
@@ -173,23 +173,36 @@ export class DockerOrchestrator implements OrchestratorSPI {
     //
     // Seed derivation: take 16 bytes of the lobbyId UUID (32 hex chars)
     // and zero-pad to 32 bytes. Stable per lobby, irrelevant otherwise.
-    const seed = lobbyId.replace(/-/g, '').padEnd(64, '0').slice(0, 64);
 
     const container = await this.docker.createContainer({
       Image: this.opts.hydraImage,
       name:  hydraName,
       Cmd: [
-        '--node-id', `offline-${lobbyId.slice(0, 8)}`,
-        '--offline-head-seed', seed,
-        '--initial-utxo', '/run/hydra/initial-utxo.json',
-        '--ledger-protocol-parameters', '/run/hydra/protocol-parameters.json',
+        '--node-id', `online-${lobbyId.slice(0, 8)}`,
+        // Chain backend: Blockfrost instead of --node-socket/--testnet-magic.
+        // The project file's network determines the chain (preprod here).
+        '--blockfrost', '/run/hydra/blockfrost-project.txt',
+        // Pre-published hydra scripts for v1.2.0 on preprod. Either form works:
+        //   --network preprod                          (uses bundled networks.json)
+        //   --hydra-scripts-tx-id <tx1>,<tx2>,<tx3>    (explicit pin)
+        '--network', 'preprod',
+        // L1 fuel key. The hydra-node pays its own L1 fees from this UTxO.
+        '--cardano-signing-key', '/run/hydra/cardano.sk',
+        // Participant set: just our own vk for now (see "caveat" below).
         '--hydra-signing-key', '/run/hydra/hydra.sk',
+        // L2 ledger config — unchanged from offline.
+        '--ledger-protocol-parameters', '/run/hydra/protocol-parameters.json',
+        // Short contestation period for testing. Default is 12h. 60s is fine on preprod;
+        // do NOT use a short value on mainnet (see Hydra docs on the safe zone).
+        '--contestation-period', '60s',
+        '--unsynced-period', '300s',
+        // API binding — unchanged.
         '--api-host', '0.0.0.0',
         '--api-port', String(this.hydraApiPort),
         '--persistence-dir', '/tmp/hydra-state',
       ],
       HostConfig: {
-        AutoRemove:    true,
+        AutoRemove:    false,
         NetworkMode:   this.opts.network,
         Memory:        512 * 1024 * 1024,  // hydra-node is heavier than the runner
         NanoCpus:      500_000_000,

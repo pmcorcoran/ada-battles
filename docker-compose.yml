@@ -39,7 +39,7 @@ services:
       # ── Hydra sidecar config (slice 1: offline mode) ──
       # Pin the hydra-node image. Bump deliberately — API events
       # and flags have moved across versions.
-      HYDRA_NODE_IMAGE: "ghcr.io/cardano-scaling/hydra-node:1.2.0"
+      HYDRA_NODE_IMAGE: "ghcr.io/cardano-scaling/hydra-node:2.0.0"
       # HOST path (not container path) to the dev-keys bundle. The
       # matchmaker passes this through to docker.createContainer as
       # a bind source, which Docker resolves on the host. Compose

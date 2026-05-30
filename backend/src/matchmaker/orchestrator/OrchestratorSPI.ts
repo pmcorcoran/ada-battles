@@ -3,8 +3,8 @@
  * platform that runs lobby-runner containers.
  *
  * Two implementations are envisioned:
- *   - DockerOrchestrator: dev, via /var/run/docker.sock
- *   - K8sOrchestrator:    prod, via the Kubernetes API
+ *   - DockerOrchestrator: MVP, via /var/run/docker.sock
+ *   - K8sOrchestrator:    scaled, via the Kubernetes API
  *
  * Add new platforms by implementing this interface — no changes to
  * Matchmaker.ts or the HTTP/WS surface required.
