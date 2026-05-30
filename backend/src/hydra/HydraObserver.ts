@@ -140,6 +140,37 @@ private fireInit(_roster: string[]): void {
     this.log(`Init send failed (non-fatal): ${(err as Error).message}`);
   }
 }
+
+  /**
+   * Resolve when the Head reaches Open. Resolves immediately if already open;
+   * rejects if the Head hits a terminal/failed state first, or after
+   * `timeoutMs`. Safe to call more than once. The runner awaits this before
+   * starting the countdown so the game only begins once the Head is open.
+   */
+  waitUntilOpen(timeoutMs = 180_000): Promise<void> {
+    if (this._status === 'open') return Promise.resolve();
+
+    return new Promise<void>((resolve, reject) => {
+      let unsub = () => {};
+      let timer: NodeJS.Timeout;
+      const done = () => { clearTimeout(timer); unsub(); };
+
+      unsub = this.onStatusChange((next) => {
+        if (next === 'open') {
+          done();
+          resolve();
+        } else if (next === 'closed' || next === 'finalized' || next === 'aborted' || next === 'error') {
+          done();
+          reject(new Error(`Head reached ${next} before opening`));
+        }
+      });
+
+      timer = setTimeout(() => {
+        done();
+        reject(new Error(`Head did not open within ${timeoutMs}ms (status=${this._status})`));
+      }, timeoutMs);
+    });
+  }
   
 
   /** POST an empty UTxO to the sidecar's /commit endpoint so the
@@ -179,30 +210,6 @@ private async sendInitialCommit(): Promise<void> {
   } catch (err) {
     this.log(`commit POST failed: ${(err as Error).message}`);
   }
-}
-
-/**
- * Resolve when the Head is open. Resolves immediately if already open.
- * Rejects if the Head hits a terminal/failed state first, or after timeoutMs.
- * Safe to call multiple times.
- */
-waitUntilOpen(timeoutMs = 180_000): Promise<void> {
-  if (this._status === 'open') return Promise.resolve();
-
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      unsub();
-      reject(new Error(`Head did not open within ${timeoutMs}ms (status=${this._status})`));
-    }, timeoutMs);
-
-    const unsub = this.onStatusChange((next) => {
-      if (next === 'open') {
-        clearTimeout(timer); unsub(); resolve();
-      } else if (next === 'closed' || next === 'finalized' || next === 'aborted' || next === 'error') {
-        clearTimeout(timer); unsub(); reject(new Error(`Head reached ${next} before opening`));
-      }
-    });
-  });
 }
 
   /**
