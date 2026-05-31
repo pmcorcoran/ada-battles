@@ -17,11 +17,14 @@
  *   GET /status      heartbeat for the matchmaker's poll loop
  *   GET /healthz     liveness for the orchestrator
  *
- * Slice 1 / Hydra: spawns a HydraObserver pointing at the per-runner
- * sidecar container. The observer logs Head state alongside Lobby
- * status; it does NOT influence gameplay. In-memory Lobby remains the
- * sole authority. The observer is owned by this process — boot it
- * after the HTTP server is up, shut it down before exit.
+ * Slice 1 / Hydra: points a pair of objects at the per-runner sidecar
+ * container — a HydraObserver (read side: owns the WS connection and
+ * reduces the event stream to a coarse status) and a HydraHeadController
+ * (write side: drives the Head via Init / Commit / Fanout / Close). They
+ * log Head state alongside Lobby status; they do NOT influence gameplay.
+ * In-memory Lobby remains the sole authority. Both are owned by this
+ * process — boot them after the HTTP server is up, shut them down before
+ * exit (close the Head via the controller, then stop the observer).
  *
  * Exits cleanly when the lobby ends and stays empty for IDLE_SHUTDOWN_MS.
  */
@@ -35,7 +38,7 @@ import type {
 import { Lobby, type ServerPlayer } from './Lobby';
 import { WebSocketHub } from './WebSocketHub';
 import { verifyWalletChallenge } from './auth/walletChallenge';
-import { HydraObserver } from './hydra';
+import { HydraObserver, HydraHeadController } from './hydra';
 
 const AUTH_SECRET = required('AUTH_SECRET');
 
@@ -65,9 +68,12 @@ app.use(express.json());
 
 const lobby = new Lobby(LOBBY_ID, MAX_PLAYERS, hub);
 
-// ── Hydra observer (now gates game start: see beginWhenHeadOpen) ────
+// ── Hydra read + write sides (the observer now gates game start: see
+//    beginWhenHeadOpen). They're constructed together and live or die
+//    together — whenever hydraObserver is set, hydraHead is too. ──────
 
 let hydraObserver: HydraObserver | null = null;
+let hydraHead:     HydraHeadController | null = null;
 
 // Guard so the Head is opened/awaited at most once per lobby, even if the
 // auto-fill and explicit request-start paths both reach the start edge.
@@ -84,6 +90,7 @@ app.get('/status', (_req, res) => {
     uptimeMs:    Math.round(process.uptime() * 1000),
     // Slice 1: surface the hydra status so it's visible to the
     // matchmaker's poll loop. Not used for routing decisions yet.
+    // Status is the read side, so it stays on the observer.
     hydraStatus: hydraObserver?.status ?? 'disabled',
   });
 });
@@ -217,17 +224,21 @@ async function beginWhenHeadOpen(): Promise<void> {
   awaitingHead = true;
 
   // No sidecar configured → no Head to open; go straight to the countdown.
-  if (!hydraObserver) {
+  // (observer and controller are constructed together, so this guard
+  // narrows both to non-null for the rest of the function.)
+  if (!hydraObserver || !hydraHead) {
     lobby.startCountdown();
     return;
   }
 
   // Show the "Opening Hydra head…" screen, then seed + wait for HeadIsOpen.
+  // Seeding (Init) is a write, so it goes through the controller; the
+  // wait reads status, so it stays on the observer.
   lobby.enterOpening();
-  hydraObserver.initHead(lobby.hydraRoster());   // idempotent (headSeeded guard)
+  hydraHead.initHead(lobby.hydraRoster());   // idempotent (headSeeded guard)
 
   try {
-    await hydraObserver.waitUntilOpen();          // resolves on HeadIsOpen
+    await hydraObserver.waitUntilOpen();      // resolves on HeadIsOpen
     if (lobby.status === 'opening') lobby.startCountdown();
   } catch (err) {
     // Hard gate: the Head never opened, so the game does NOT start. The
@@ -246,13 +257,20 @@ function delay(ms: number): Promise<void> {
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[${LOBBY_ID}] runner listening on :${PORT} (max ${MAX_PLAYERS})`);
 
-  // Slice 1: bring up the Hydra observer AFTER the HTTP server is
+  // Slice 1: bring up the Hydra read/write pair AFTER the HTTP server is
   // listening (so /status is responsive while we wait on the sidecar)
   // but it is not strictly required to be ready before accepting WS
-  // upgrades — the observer is non-authoritative. start() is
-  // tolerant of sidecar-unreachable (logs and returns).
+  // upgrades — these are non-authoritative. start() is tolerant of
+  // sidecar-unreachable (logs and returns).
+  //
+  // Construct the controller BEFORE start() so it's subscribed to the
+  // observer's protocol-event stream before any frames arrive.
   if (HYDRA_SIDECAR_URL) {
     hydraObserver = new HydraObserver({
+      lobbyId:    LOBBY_ID,
+      sidecarUrl: HYDRA_SIDECAR_URL,
+    });
+    hydraHead = new HydraHeadController(hydraObserver, {
       lobbyId:    LOBBY_ID,
       sidecarUrl: HYDRA_SIDECAR_URL,
     });
@@ -266,11 +284,12 @@ process.on('SIGTERM', () => void shutdown(0));
 process.on('SIGINT',  () => void shutdown(0));
 
 async function shutdown(code: number): Promise<void> {
-  // Runner owns sidecar lifecycle: close the Head BEFORE tearing down
-  // the WS observer client. closeHead() drives Close → Fanout → Finalized
-  // and resolves on terminal status; stop() then closes the WS cleanly.
-  if (hydraObserver) {
-    try { await hydraObserver.closeHead(); } catch (err) {
+  // Runner owns sidecar lifecycle: close the Head BEFORE tearing down the
+  // WS connection. The controller drives Close → Fanout → Finalized and
+  // resolves on terminal status; the observer's stop() then closes the WS
+  // cleanly. (Both are set together, so this single guard covers both.)
+  if (hydraObserver && hydraHead) {
+    try { await hydraHead.closeHead(); } catch (err) {
       console.warn(`[${LOBBY_ID}] hydra closeHead failed: ${(err as Error).message}`);
     }
     try { await hydraObserver.stop(); } catch (err) {

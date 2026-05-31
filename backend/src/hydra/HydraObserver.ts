@@ -5,20 +5,35 @@
  * event stream to a coarse HydraStatus, and log transitions alongside
  * the in-memory Lobby's own status.
  *
- * Authority lives in Lobby for now. This is purely observational — no
- * Lobby methods are called from here. The point is to surface the
- * integration mechanics (sidecar lifecycle, WS reconnect, event
- * vocabulary mismatches) before slice 2 makes it authoritative.
+ * This file is the READ side of the sidecar integration. After the
+ * observer/controller split it does exactly two things and nothing else:
  *
- * Why the indirection (observer wrapping client): when slice 2 lands,
- * the runner won't talk directly to the WS. It'll talk through this
- * observer, which will own the state-machine reduction and the
- * (eventual) call into Lobby. Keeping that seam in place now means
- * slice 2 is a code edit in one file rather than across the runner.
+ *   1. Own the sidecar WS connection lifecycle (start / stop).
+ *   2. Reduce the server-output stream to a HydraStatus and notify
+ *      subscribers of (a) status transitions and (b) the raw protocol
+ *      events themselves.
+ *
+ * It performs NO sends of its own. Everything that drives the Head
+ * (Init, the initial Commit, Fanout, Close) now lives in
+ * HydraHeadController, which subscribes here and issues those commands
+ * through the single `send()` seam below. Keeping reduction and command
+ * policy apart is what lets slice 2 grow the driving logic without
+ * touching the reducer — and it makes the "purely observational" claim
+ * in the old header actually true again.
+ *
+ * Authority still lives in Lobby for slice 1; nothing here calls into
+ * Lobby. The point remains to surface the integration mechanics (sidecar
+ * lifecycle, WS reconnect, event-vocabulary mismatches) before slice 2
+ * makes the Head authoritative.
  */
 
 import { HydraSidecarClient, type StatusHandler } from './HydraSidecarClient';
-import type { HydraStatus, HydraServerOutput } from './types';
+import type { HydraStatus, HydraServerOutput, HydraClientCommand } from './types';
+
+/** Notified for every server output, after the status reduction for that
+ *  event has been applied. The HydraHeadController uses this to decide
+ *  when to send commands (e.g. Fanout on ReadyToFanout). */
+export type ProtocolEventHandler = (event: HydraServerOutput) => void;
 
 export interface HydraObserverOptions {
   lobbyId: string;
@@ -29,17 +44,9 @@ export interface HydraObserverOptions {
 export class HydraObserver {
   private client: HydraSidecarClient;
   private _status: HydraStatus = 'connecting';
-  private connected = false;
-  /** Ensures the Head is seeded at most once per lobby, even if both the
-   *  auto-fill and explicit request-start paths reach the edge. */
-  private headSeeded = false;
-  private nodeSynced = false;
-  private pendingRoster: string[] | null = null;
+  private _connected = false;
   private statusHandlers: StatusHandler[] = [];
-  /** Guard so Close only fires once even if closeHead() is called twice. */
-  private closeRequested = false;
-  /** Guard so the initial Commit only fires once on HeadIsInitializing. */
-  private committed = false;
+  private protocolHandlers: ProtocolEventHandler[] = [];
 
   constructor(private readonly opts: HydraObserverOptions) {
     this.client = new HydraSidecarClient({
@@ -55,6 +62,12 @@ export class HydraObserver {
     return this._status;
   }
 
+  /** True once the initial connect() has succeeded. The controller reads
+   *  this before attempting any send. */
+  get connected(): boolean {
+    return this._connected;
+  }
+
   /**
    * Bring up the sidecar connection. Returns on the first frame
    * received (typically Greetings). In slice 1 a failure here is
@@ -66,7 +79,7 @@ export class HydraObserver {
     this.log(`connecting to sidecar at ${this.opts.sidecarUrl}`);
     try {
       await this.client.connect();
-      this.connected = true;
+      this._connected = true;
       this.log('connected to sidecar');
     } catch (err) {
       this.setStatus('error');
@@ -76,70 +89,23 @@ export class HydraObserver {
 
   /**
    * Stop observation and close the sidecar WS cleanly.
-   * Decision (ii): runner owns sidecar lifecycle. In slice 2 this
-   * will also send a `Close` command and wait for HeadIsFinalized
-   * before resolving.
+   * Decision (ii): runner owns sidecar lifecycle. The Head is driven to a
+   * terminal state by HydraHeadController.closeHead() BEFORE this is
+   * called — see runner shutdown ordering.
    */
   async stop(): Promise<void> {
     this.log('stopping observer');
     await this.client.close();
   }
 
-
   /**
-   * Seed the Head with the player-derived participant set when the lobby
-   * fills. This is the keys→roster→Head step.
-   *
-   * Offline/slice-1 reality: the participant set of an offline head is
-   * fixed by the node's own flags (--offline-head-seed + the single
-   * --hydra-signing-key), and `Init` is fundamentally an L1 action. So
-   * the collected vks cannot yet *become* the on-chain participants of
-   * this offline sidecar — that needs online mode and one node per key
-   * (the deferred Option-A topology). What this method does today:
-   *
-   *   1. Log the assembled roster of player vks (the real deliverable —
-   *      it proves keys flowed browser → upgrade URL → runner → here).
-   *   2. Best-effort send `{ tag: 'Init' }` so the lifecycle wiring
-   *      (send → HydraObserver reduction) is exercised end to end. In
-   *      offline mode this may be a no-op or surface CommandFailed;
-   *      either is logged and NON-fatal, consistent with slice-1's
-   *      non-authoritative stance. No gameplay depends on the result.
-   *
-   * Slice-2 swap point: when per-player online nodes land, this method's
-   * body becomes "configure peers from `roster`, then Init", and the
-   * roster stops being merely logged.
+   * The single write path into the sidecar WS. The observer owns the
+   * socket but performs no sends of its own; HydraHeadController calls
+   * this to issue Init / Fanout / Close. May throw — callers wrap.
    */
-  initHead(roster: string[]): void {
-    if (this.headSeeded) return;
-    this.headSeeded = true;
-    const present = roster.filter((vk) => vk.length > 0).length;
-    this.log(
-      `lobby full — seeding Head with ${present}/${roster.length} player vk(s)`,
-    );
-    roster.forEach((vk, slot) => {
-      this.log(`  slot ${slot}: ${vk ? summariseVk(vk) : '<no vk presented>'}`);
-    });
-
-    if (!this.connected) {
-      this.log('sidecar not connected; skipping Init (non-authoritative)');
-      return;
-    }
-    if (!this.nodeSynced) {
-    this.log('node not yet synced — queuing Init until NodeSynced fires');
-    this.pendingRoster = roster;
-    return;
+  send(cmd: HydraClientCommand): void {
+    this.client.send(cmd);
   }
-  this.fireInit(roster);
-}
-
-private fireInit(_roster: string[]): void {
-  try {
-    this.client.send({ tag: 'Init' });
-    this.log('sent Init to sidecar');
-  } catch (err) {
-    this.log(`Init send failed (non-fatal): ${(err as Error).message}`);
-  }
-}
 
   /**
    * Resolve when the Head reaches Open. Resolves immediately if already open;
@@ -171,105 +137,25 @@ private fireInit(_roster: string[]): void {
       }, timeoutMs);
     });
   }
-  
-
-  /** POST an empty UTxO to the sidecar's /commit endpoint so the
- *  Initializing → Open transition can complete. Single-participant
- *  referee head: the sidecar owns the cardano-signing-key, so it
- *  builds, signs, and submits the commit tx on its own. */
-private async sendInitialCommit(): Promise<void> {
-  if (this.committed) return;
-  this.committed = true;
-
-  // Convert ws://hydra-<id>:4001/?history=no → http://hydra-<id>:4001/commit
-  const httpBase = this.opts.sidecarUrl
-    .replace(/^ws:/, 'http:')
-    .replace(/\?.*$/, '')
-    .replace(/\/$/, '');
-  const url = `${httpBase}/commit`;
-
-  this.log(`POST ${url} (empty commit)`);
-  try {
-    // Node 18+ has global fetch. If you're on 16, swap to node-fetch
-    // or the built-in `http` module.
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const bodyText = await res.text();
-    if (!res.ok) {
-      this.log(`commit HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
-      return;
-    }
-    this.log(`commit accepted (${bodyText.length} bytes returned)`);
-    // hydra-node 1.x: an empty commit returns a balanced+signed tx
-    // that the node itself submits — there's nothing to do with the
-    // response body. Watch for the `Committed` then `HeadIsOpen`
-    // events on the WS stream.
-  } catch (err) {
-    this.log(`commit POST failed: ${(err as Error).message}`);
-  }
-}
-
-  /**
- * Drive the Head to a terminal state and resolve when it gets there.
- *
- * Sequence:
- *   send Close  →  HeadIsClosed  →  (contestation deadline)
- *               →  ReadyToFanout →  send Fanout  →  HeadIsFinalized
- *
- * The Fanout send is wired into handleOutput, so this method only
- * needs to fire Close and wait for the terminal status.
- *
- * Tolerates being called from non-open states (logs and returns).
- */
-async closeHead(): Promise<void> {
-  if (this.closeRequested) return;
-  this.closeRequested = true;
-
-  if (!this.connected) {
-    this.log('sidecar not connected; skipping closeHead');
-    return;
-  }
-  if (this._status === 'finalized' || this._status === 'aborted') {
-    this.log(`closeHead: already ${this._status}, nothing to do`);
-    return;
-  }
-  if (this._status === 'idle' || this._status === 'connecting') {
-    this.log(`closeHead: head never opened (status=${this._status}), skipping`);
-    return;
-  }
-
-  this.log(`closeHead: starting close from status=${this._status}`);
-
-  const terminal = new Promise<void>((resolve) => {
-    const unsub = this.onStatusChange((next) => {
-      if (next === 'finalized' || next === 'aborted' || next === 'error') {
-        unsub();
-        resolve();
-      }
-    });
-  });
-
-  try {
-    this.client.send({ tag: 'Close' });
-    this.log('sent Close to sidecar');
-  } catch (err) {
-    this.log(`Close send failed: ${(err as Error).message}`);
-    return;
-  }
-
-  await terminal;
-  this.log(`closeHead: done, final status=${this._status}`);
-}
 
   /** Subscribe to status transitions. Returns an unsubscribe fn. */
-  private onStatusChange(handler: StatusHandler): () => void {
+  onStatusChange(handler: StatusHandler): () => void {
     this.statusHandlers.push(handler);
     return () => {
       const i = this.statusHandlers.indexOf(handler);
       if (i >= 0) this.statusHandlers.splice(i, 1);
+    };
+  }
+
+  /** Subscribe to raw protocol events (fired after the status reduction
+   *  for that event). Returns an unsubscribe fn. This is how the
+   *  HydraHeadController hears about milestones like HeadIsInitializing,
+   *  NodeSynced, and ReadyToFanout so it can drive the Head. */
+  onProtocolEvent(handler: ProtocolEventHandler): () => void {
+    this.protocolHandlers.push(handler);
+    return () => {
+      const i = this.protocolHandlers.indexOf(handler);
+      if (i >= 0) this.protocolHandlers.splice(i, 1);
     };
   }
 
@@ -280,70 +166,78 @@ async closeHead(): Promise<void> {
     // vocabulary is well-understood we can dial this down.
     this.log(`recv: ${event.tag}${event.headStatus ? ` (headStatus=${event.headStatus})` : ''}`);
 
+    // 1. Reduce to status (side-effect free apart from WARN logging).
+    const next = this.reduce(event);
+    if (next) this.setStatus(next);
+
+    // 2. Notify the controller AFTER status has settled, so any command
+    //    it issues sees an up-to-date `observer.status`.
+    this.emitProtocol(event);
+  }
+
+  /**
+   * Pure-ish reduction: map a server output to the next HydraStatus, or
+   * null for "no status change". The only side effects are WARN logs for
+   * events we want to surface loudly. Crucially, this sends nothing — the
+   * Init/Commit/Fanout that used to live in these cases now belong to
+   * HydraHeadController, triggered via onProtocolEvent.
+   */
+  private reduce(event: HydraServerOutput): HydraStatus | null {
     switch (event.tag) {
       case 'Greetings':
         // hydra-node's first message after WS open. `headStatus`
         // field tells us where the head currently is — in slice 1
         // (no Init has been sent), this should be 'Idle'.
-        this.setStatus(mapHeadStatus(event.headStatus, 'idle'));
-        return;
-      //case 'HeadIsInitializing': this.setStatus('initializing'); return;
-      case 'Committed':          /* stays in initializing */     return;
-      case 'HeadIsOpen':         this.setStatus('open');         return;
-      case 'HeadIsClosed':       this.setStatus('closed');       return;
+        return mapHeadStatus(event.headStatus, 'idle');
+
+      case 'Committed':          return null;  // stays in initializing
+      case 'HeadIsOpen':         return 'open';
+      case 'HeadIsClosed':       return 'closed';
+
       case 'ReadyToFanout':
-        // Contestation period has elapsed. Spend the closed UTxO so funds
-        // (or empty L2 state, in our case) are made canonical on L1.
-        try {
-          this.client.send({ tag: 'Fanout' });
-          this.log('sent Fanout to sidecar');
-        } catch (err) {
-          this.log(`Fanout send failed: ${(err as Error).message}`);
-        }
-        return;
-      case 'HeadIsFinalized':    this.setStatus('finalized');    return;
-      case 'HeadIsAborted':      this.setStatus('aborted');      return;
+        // Contestation period has elapsed. The controller spends the
+        // closed UTxO (Fanout) on hearing this event — no status change.
+        return null;
+
+      case 'HeadIsFinalized':    return 'finalized';
+      case 'HeadIsAborted':      return 'aborted';
+
       case 'CommandFailed':
       case 'HeadIsInitializing':
-        this.setStatus('initializing');
-        // Don't await — keep the event loop free. Errors are logged inside.
-        void this.sendInitialCommit();
-        return;
+        // The controller sends the initial Commit on these events so the
+        // Initializing → Open transition can complete.
+        return 'initializing';
+
       case 'PostTxOnChainFailed':
         // Don't change state; failed commands don't move the head.
         // Surface as a warning so failures during slice 2's tx-submit
         // path are loud enough to notice.
         this.log(`WARN: ${event.tag}: ${JSON.stringify(event)}`);
-        return;
+        return null;
+
       case 'NodeSynced':
-        if (!this.nodeSynced) {
-          this.nodeSynced = true;
-          this.log('node reached chain sync');
-          // If initHead was called early, fire the Init now.
-          if (this.pendingRoster) {
-            const roster = this.pendingRoster;
-            this.pendingRoster = null;
-            this.fireInit(roster);
-          }
-        }
-        return;
+        // No status change; the controller tracks sync state because it
+        // gates Init (a write concern).
+        return null;
+
       case 'RejectedInputBecauseUnsynced': {
         const drift = (event as { drift?: number }).drift;
         const which = ((event as { clientInput?: { tag?: string } }).clientInput?.tag) ?? 'unknown';
         this.log(`WARN: ${which} rejected — node out of sync (drift=${drift}s)`);
-        return;
+        return null;
       }
+
       default:
         // Unrecognized — common in normal operation (PeerConnected,
-        // SnapshotConfirmed, TxValid, etc.). Already logged at
-        // the top of this method; nothing else to do.
-        return;
+        // SnapshotConfirmed, TxValid, etc.). Already logged at the top
+        // of handleOutput; nothing else to do.
+        return null;
     }
   }
 
   private handleError(err: Error): void {
     this.log(`ERR: ${err.message}`);
-    if (!this.connected) return; // startup errors handled by start()
+    if (!this._connected) return; // startup errors handled by start()
     this.setStatus('error');
   }
 
@@ -356,8 +250,6 @@ async closeHead(): Promise<void> {
     this.setStatus('error');
   }
 
-  
-
   private setStatus(next: HydraStatus): void {
     if (next === this._status) return;
     const prev = this._status;
@@ -369,6 +261,13 @@ async closeHead(): Promise<void> {
     }
   }
 
+  private emitProtocol(event: HydraServerOutput): void {
+    for (const h of this.protocolHandlers) {
+      try { h(event); }
+      catch (err) { this.log(`protocol handler threw: ${(err as Error).message}`); }
+    }
+  }
+
   private log(msg: string): void {
     console.log(`[hydra:${shortId(this.opts.lobbyId)}] ${msg}`);
   }
@@ -376,22 +275,6 @@ async closeHead(): Promise<void> {
 
 function shortId(uuid: string): string {
   return uuid.slice(0, 8);
-}
-
-/** Pull a short, log-friendly fingerprint out of a vk envelope without
- *  dumping the whole JSON. Falls back to a length note if the shape is
- *  unexpected — we never throw from a logging helper. */
-function summariseVk(vkEnvelope: string): string {
-  try {
-    const parsed = JSON.parse(vkEnvelope) as { cborHex?: string };
-    const hex = parsed.cborHex ?? '';
-    // Strip the 5820 CBOR prefix if present; show first/last 6 hex chars.
-    const body = hex.startsWith('5820') ? hex.slice(4) : hex;
-    if (body.length >= 12) return `${body.slice(0, 6)}…${body.slice(-6)}`;
-    return body || '<empty cborHex>';
-  } catch {
-    return `<unparseable vk, ${vkEnvelope.length} chars>`;
-  }
 }
 
 function mapHeadStatus(raw: string | undefined, fallback: HydraStatus): HydraStatus {
