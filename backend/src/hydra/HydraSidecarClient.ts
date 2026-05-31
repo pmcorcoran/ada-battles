@@ -26,8 +26,8 @@ import type { HydraServerOutput, HydraClientCommand, HydraStatus} from './types'
 
 export type StatusHandler = (next: HydraStatus, prev: HydraStatus) => void;
 
-const STARTUP_RETRIES = 30;     // 12 × 1s ≈ 12s, comfortable for cold start
-const STARTUP_RETRY_DELAY_MS = 4_000;
+const STARTUP_RETRIES = 15;     // 12 × 1s ≈ 12s, comfortable for cold start
+const STARTUP_RETRY_DELAY_MS = 12_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 
 type OutputHandler = (event: HydraServerOutput) => void;

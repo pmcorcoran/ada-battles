@@ -843,36 +843,20 @@
     const t = performance.now() / 1e3;
     ctx.fillStyle = "rgba(10, 10, 25, 0.82)";
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    const r = 26;
-    ctx.save();
-    ctx.translate(cx, cy - 96);
-    ctx.rotate(t * 2.2 % (Math.PI * 2));
-    ctx.lineWidth = 5;
-    ctx.lineCap = "round";
-    ctx.strokeStyle = "rgba(255,255,255,0.15)";
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.strokeStyle = COLORS.SELF;
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 1.35);
-    ctx.stroke();
-    ctx.restore();
-    const dots = ".".repeat(1 + Math.floor(t * 2) % 3);
     ctx.fillStyle = COLORS.WHITE;
     ctx.font = "bold 42px Arial";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(`Opening Hydra Head${dots}`, cx, cy - 6);
+    ctx.fillText(`Opening Hydra Head`, cx, cy - 13);
     ctx.fillStyle = "#b9c2d0";
     ctx.font = "18px Arial";
     ctx.fillText(
-      "Settling the match on-chain \u2014 this can take a minute on preprod.",
+      "Prepare for battle",
       cx,
-      cy + 34
+      cy + 27
     );
     const barW = 320, barH = 8;
-    const barX = cx - barW / 2, barY = cy + 72, radius = barH / 2;
+    const barX = cx - barW / 2, barY = cy + 65, radius = barH / 2;
     roundRect(ctx, barX, barY, barW, barH, radius);
     ctx.fillStyle = "rgba(255,255,255,0.12)";
     ctx.fill();
