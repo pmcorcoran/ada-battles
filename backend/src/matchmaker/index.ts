@@ -17,7 +17,7 @@ const PUBLIC_WS_HOST = process.env.PUBLIC_WS_HOST ?? 'localhost';
 const PUBLIC_PORT    = process.env.PUBLIC_PORT    ?? '8080';
 
 const HYDRA_NODE_IMAGE         = process.env.HYDRA_NODE_IMAGE
-  ?? 'ghcr.io/cardano-scaling/hydra-node:1.2.0';
+  ?? 'ghcr.io/cardano-scaling/hydra-node:2.0.0';
 const HYDRA_DEV_KEYS_HOST_PATH = required('HYDRA_DEV_KEYS_HOST_PATH');
 
 const orchestrator = new DockerOrchestrator({
