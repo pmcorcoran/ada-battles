@@ -3,13 +3,21 @@
  *
  * A single-lobby server. One container per match. Boots with:
  *
- *   LOBBY_ID            the matchmaker-assigned UUID
- *   MAX_PLAYERS         3..5
- *   PORT                defaults to 3000
- *   IDLE_SHUTDOWN_MS    shut down the process after this much time empty
- *   AUTH_SECRET         shared HMAC secret with the matchmaker
- *   HYDRA_SIDECAR_URL   ws://hydra-<id>:4001/?history=no — optional in
- *                       slice 1 (runner continues if unreachable)
+ *   LOBBY_ID              the matchmaker-assigned UUID
+ *   MAX_PLAYERS           3..5
+ *   PORT                  defaults to 3000
+ *   IDLE_SHUTDOWN_MS      shut down the process after this much time empty
+ *   AUTH_SECRET           shared HMAC secret with the matchmaker
+ *   HYDRA_SIDECAR_URL     ws://hydra-<id>:4001/?history=no — the REFEREE
+ *                         (party 0) node. Optional (runner continues if
+ *                         unreachable).
+ *   HYDRA_PARTY_API_URLS  comma-separated http base URLs, one per party
+ *                         node, party 0 first:
+ *                           http://hydra-<id>:4001,http://hydra-<id>-p1:4001,…
+ *                         Optional — when absent (single-node setups), a
+ *                         one-element list is derived from
+ *                         HYDRA_SIDECAR_URL so behaviour is unchanged.
+ *   HYDRA_PARTY_COUNT     informational; logged at boot.
  *
  * Wires player WebSockets to the same Lobby class the monolith uses.
  * Adds:
@@ -17,14 +25,17 @@
  *   GET /status      heartbeat for the matchmaker's poll loop
  *   GET /healthz     liveness for the orchestrator
  *
- * Slice 1 / Hydra: points a pair of objects at the per-runner sidecar
- * container — a HydraObserver (read side: owns the WS connection and
- * reduces the event stream to a coarse status) and a HydraHeadController
- * (write side: drives the Head via Init / Commit / Fanout / Close). They
- * log Head state alongside Lobby status; they do NOT influence gameplay.
- * In-memory Lobby remains the sole authority. Both are owned by this
- * process — boot them after the HTTP server is up, shut them down before
- * exit (close the Head via the controller, then stop the observer).
+ * Hydra: points a pair of objects at the per-match node mesh — a
+ * HydraObserver (read side: owns the WS connection to the referee node
+ * and reduces the event stream to a coarse status) and a
+ * HydraHeadController (write side: drives the Head via Init / per-party
+ * Commits / Fanout / Close). WS lifecycle commands go to party 0 only
+ * (Init/Close/Fanout are head-level actions); HTTP commits fan out to
+ * every party URL, because a multi-party head only opens once each
+ * participant has committed. In-memory Lobby remains the gameplay
+ * authority. Both are owned by this process — boot them after the HTTP
+ * server is up, shut them down before exit (close the Head via the
+ * controller, then stop the observer).
  *
  * Exits cleanly when the lobby ends and stays empty for IDLE_SHUTDOWN_MS.
  */
@@ -48,8 +59,16 @@ const LOBBY_ID         = required('LOBBY_ID');
 const MAX_PLAYERS      = parseIntStrict(required('MAX_PLAYERS'));
 const PORT             = Number(process.env.PORT ?? 3000);
 const IDLE_SHUTDOWN_MS = Number(process.env.IDLE_SHUTDOWN_MS ?? 5 * 60_000);
-const HYDRA_SIDECAR_URL = process.env.HYDRA_SIDECAR_URL; // optional in slice 1
+const HYDRA_SIDECAR_URL = process.env.HYDRA_SIDECAR_URL; // optional
 const MIN_OPENING_MS   = 2_500;
+
+// Party API roster for the controller's per-party commit fan-out.
+// Falls back to a single-element list derived from the referee WS URL,
+// which reproduces the old single-node behaviour exactly.
+const HYDRA_PARTY_API_URLS: string[] = (process.env.HYDRA_PARTY_API_URLS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (MAX_PLAYERS < 3 || MAX_PLAYERS > 5) {
   console.error(`MAX_PLAYERS=${MAX_PLAYERS} out of range [3, 5]`);
@@ -88,9 +107,9 @@ app.get('/status', (_req, res) => {
     playerCount: lobby.players.size,
     maxPlayers:  MAX_PLAYERS,
     uptimeMs:    Math.round(process.uptime() * 1000),
-    // Slice 1: surface the hydra status so it's visible to the
-    // matchmaker's poll loop. Not used for routing decisions yet.
-    // Status is the read side, so it stays on the observer.
+    // Surface the hydra status so it's visible to the matchmaker's
+    // poll loop. Not used for routing decisions yet. Status is the
+    // read side, so it stays on the observer.
     hydraStatus: hydraObserver?.status ?? 'disabled',
   });
 });
@@ -257,22 +276,39 @@ function delay(ms: number): Promise<void> {
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[${LOBBY_ID}] runner listening on :${PORT} (max ${MAX_PLAYERS})`);
 
-  // Slice 1: bring up the Hydra read/write pair AFTER the HTTP server is
+  // Bring up the Hydra read/write pair AFTER the HTTP server is
   // listening (so /status is responsive while we wait on the sidecar)
   // but it is not strictly required to be ready before accepting WS
-  // upgrades — these are non-authoritative. start() is tolerant of
-  // sidecar-unreachable (logs and returns).
+  // upgrades. start() is tolerant of sidecar-unreachable (logs and
+  // returns).
   //
   // Construct the controller BEFORE start() so it's subscribed to the
   // observer's protocol-event stream before any frames arrive.
   if (HYDRA_SIDECAR_URL) {
+    // Party roster for the commit fan-out. When the orchestrator didn't
+    // provide one (legacy single-node spawn), derive party 0's HTTP base
+    // from the referee WS URL: ws://X/?q → http://X.
+    const partyApiUrls = HYDRA_PARTY_API_URLS.length > 0
+      ? HYDRA_PARTY_API_URLS
+      : [HYDRA_SIDECAR_URL
+          .replace(/^ws:/, 'http:')
+          .replace(/\?.*$/, '')
+          .replace(/\/$/, '')];
+
+    console.log(
+      `[${LOBBY_ID}] hydra parties: ${partyApiUrls.length}` +
+      (process.env.HYDRA_PARTY_COUNT
+        ? ` (orchestrator says ${process.env.HYDRA_PARTY_COUNT})`
+        : ''),
+    );
+
     hydraObserver = new HydraObserver({
       lobbyId:    LOBBY_ID,
       sidecarUrl: HYDRA_SIDECAR_URL,
     });
     hydraHead = new HydraHeadController(hydraObserver, {
-      lobbyId:    LOBBY_ID,
-      sidecarUrl: HYDRA_SIDECAR_URL,
+      lobbyId: LOBBY_ID,
+      partyApiUrls,
     });
     await hydraObserver.start();
   } else {
@@ -328,7 +364,7 @@ function parseIntStrict(s: string): number {
  * — the vk is participant identity, not auth (auth already passed to
  * reach this point), so a missing or malformed vk yields '' rather than
  * rejecting the connection. The roster tolerates empty slots and logs
- * them; offline/slice-1 doesn't depend on the vk being present.
+ * them.
  */
 function parseHydraVk(socketUrl: string): string {
   try {

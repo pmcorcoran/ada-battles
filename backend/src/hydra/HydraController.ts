@@ -5,23 +5,31 @@
  * Where the observer only reduces the event stream to a status, this
  * class owns every command that drives the Head through its lifecycle:
  *
- *   - initHead()          send `Init` once the lobby fills (keys→roster→Head)
- *   - sendInitialCommit() POST an empty commit so Initializing → Open completes
- *   - (Fanout)            spend the closed UTxO once contestation elapses
- *   - closeHead()         drive Close → Fanout → Finalized on shutdown
+ *   - initHead()           send `Init` once the lobby fills (keys→roster→Head)
+ *   - sendInitialCommits() POST a commit to EVERY party node so
+ *                          Initializing → Open can complete
+ *   - (Fanout)             spend the closed UTxO once contestation elapses
+ *   - closeHead()          drive Close → Fanout → Finalized on shutdown
  *
  * It holds no socket of its own. It reads status from the observer
  * (`observer.status`, `observer.connected`, `observer.onStatusChange`),
  * reacts to protocol milestones via `observer.onProtocolEvent`, and
- * issues commands through the observer's single `send()` seam. All the
- * write-side bookkeeping (headSeeded / committed / closeRequested /
- * nodeSynced / pendingRoster) lives here, not in the reducer.
+ * issues WS commands through the observer's single `send()` seam — which
+ * talks to party 0 (the referee node) only. HTTP commits, by contrast,
+ * must reach EVERY party: a multi-party head stays in Initializing until
+ * each participant's commit lands on L1, so sendInitialCommits() fans
+ * out over `partyApiUrls`.
  *
- * Slice-1 stance is unchanged: sends are best-effort and non-fatal. The
- * value today is exercising the lifecycle wiring end to end; no gameplay
- * depends on the result. The methods flagged below as "slice-2 swap
- * points" are exactly the ones that grow when authority moves on-chain —
- * having them isolated here is the point of the split.
+ * N+1 stance: the orchestrator now spawns one hydra-node per party
+ * (party 0 = referee, parties 1..N = player slots; operator-custodial
+ * hydra keys, operator-generated fuel keys). Lifecycle commands (Init /
+ * Close / Fanout) still only need to be issued once, on any node — they
+ * are head-level L1 actions — so driving them via the referee's WS is
+ * unchanged. Commits are the one per-party obligation, hence the loop.
+ *
+ * Slice stance is otherwise unchanged: sends are best-effort and
+ * non-fatal. The methods flagged below as "swap points" are exactly the
+ * ones that grow when authority moves on-chain.
  */
 
 import type { HydraObserver } from './HydraObserver';
@@ -29,15 +37,21 @@ import type { HydraServerOutput } from './types';
 
 export interface HydraHeadControllerOptions {
   lobbyId: string;
-  /** ws://hydra-<lobbyId>:4001/?history=no — used to derive the /commit URL. */
-  sidecarUrl: string;
+  /**
+   * One HTTP base URL per party node, party 0 (the referee) FIRST:
+   *   ["http://hydra-<id>:4001", "http://hydra-<id>-p1:4001", ...]
+   * Provided by the orchestrator via HYDRA_PARTY_API_URLS. A
+   * single-element list reproduces the old single-node behaviour.
+   */
+  partyApiUrls: string[];
 }
 
 export class HydraHeadController {
   /** Ensures the Head is seeded at most once per lobby, even if both the
    *  auto-fill and explicit request-start paths reach the edge. */
   private headSeeded = false;
-  /** Guard so the initial Commit only fires once on HeadIsInitializing. */
+  /** Guard so the per-party Commit fan-out only fires once on
+   *  HeadIsInitializing. */
   private committed = false;
   /** Guard so Close only fires once even if closeHead() is called twice. */
   private closeRequested = false;
@@ -48,6 +62,9 @@ export class HydraHeadController {
     private readonly observer: HydraObserver,
     private readonly opts: HydraHeadControllerOptions,
   ) {
+    if (opts.partyApiUrls.length === 0) {
+      throw new Error('HydraHeadController: partyApiUrls must be non-empty');
+    }
     // React to the milestones that used to trigger sends from inside the
     // observer's switch. The observer fires these after applying its own
     // status reduction, so `observer.status` is current here.
@@ -58,24 +75,21 @@ export class HydraHeadController {
    * Seed the Head with the player-derived participant set when the lobby
    * fills. This is the keys→roster→Head step.
    *
-   * Offline/slice-1 reality: the participant set of an offline head is
-   * fixed by the node's own flags (--offline-head-seed + the single
-   * --hydra-signing-key), and `Init` is fundamentally an L1 action. So
-   * the collected vks cannot yet *become* the on-chain participants of
-   * this offline sidecar — that needs online mode and one node per key
-   * (the deferred Option-A topology). What this method does today:
+   * N+1 reality: the participant set is now fixed by the orchestrator at
+   * spawn time (one node per party, vks exchanged as boot flags), so the
+   * roster collected from browsers still cannot *become* the on-chain
+   * participants of this match — the nodes are already running with
+   * operator-provisioned hydra keys. What this method does today:
    *
-   *   1. Log the assembled roster of player vks (the real deliverable —
-   *      it proves keys flowed browser → upgrade URL → runner → here).
-   *   2. Best-effort send `{ tag: 'Init' }` so the lifecycle wiring
-   *      (send → HydraObserver reduction) is exercised end to end. In
-   *      offline mode this may be a no-op or surface CommandFailed;
-   *      either is logged and NON-fatal, consistent with slice-1's
-   *      non-authoritative stance. No gameplay depends on the result.
+   *   1. Log the assembled roster of player vks (it proves keys flowed
+   *      browser → upgrade URL → runner → here; the day player keys
+   *      replace the custodial pool, this is the data that does it).
+   *   2. Send `{ tag: 'Init' }` via the referee node. Init is a
+   *      head-level L1 action — one party posts it on behalf of the
+   *      participant set, so issuing it once on party 0 is correct.
    *
-   * Slice-2 swap point: when per-player online nodes land, this method's
-   * body becomes "configure peers from `roster`, then Init", and the
-   * roster stops being merely logged.
+   * Swap point: when client-held hydra keys land, sidecar spawn moves to
+   * lobby-full time and this roster stops being merely logged.
    */
   initHead(roster: string[]): void {
     if (this.headSeeded) return;
@@ -108,13 +122,15 @@ export class HydraHeadController {
    *               →  HeadIsFinalized
    *
    * The Fanout send is handled by onProtocolEvent(), so this method only
-   * needs to fire Close and wait for the terminal status.
+   * needs to fire Close and wait for the terminal status. Close, like
+   * Init, is a head-level action: one party posting it suffices, so the
+   * referee's WS remains the single write path.
+   *
+   * From `initializing` the correct command is Abort, not Close — Close
+   * is only valid on an open head; Abort returns any commits and lands
+   * on HeadIsAborted (terminal).
    *
    * Tolerates being called from non-open states (logs and returns).
-   *
-   * Slice-2 note: this already matches the intended shutdown shape; what
-   * changes later is that the L2 state being fanned out is real game
-   * state rather than the empty offline UTxO.
    */
   async closeHead(): Promise<void> {
     if (this.closeRequested) return;
@@ -146,10 +162,16 @@ export class HydraHeadController {
     });
 
     try {
-      this.observer.send({ tag: 'Close' });
-      this.log('sent Close to sidecar');
+      if (status === 'initializing') {
+        // Head never opened — unwind it instead of closing it.
+        this.observer.send({ tag: 'Abort' });
+        this.log('sent Abort to sidecar (head was still initializing)');
+      } else {
+        this.observer.send({ tag: 'Close' });
+        this.log('sent Close to sidecar');
+      }
     } catch (err) {
-      this.log(`Close send failed: ${(err as Error).message}`);
+      this.log(`Close/Abort send failed: ${(err as Error).message}`);
       return;
     }
 
@@ -168,7 +190,7 @@ export class HydraHeadController {
       case 'HeadIsInitializing':
       case 'CommandFailed':
         // Don't await — keep the event loop free. Errors are logged inside.
-        void this.sendInitialCommit();
+        void this.sendInitialCommits();
         return;
 
       case 'NodeSynced':
@@ -211,43 +233,69 @@ export class HydraHeadController {
     }
   }
 
-  /** POST an empty UTxO to the sidecar's /commit endpoint so the
-   *  Initializing → Open transition can complete. Single-participant
-   *  referee head: the sidecar owns the cardano-signing-key, so it
-   *  builds, signs, and submits the commit tx on its own. */
-  private async sendInitialCommit(): Promise<void> {
+  /**
+   * POST a commit to EVERY party node's /commit endpoint so the
+   * Initializing → Open transition can complete. In a multi-party head
+   * the protocol waits for one commit per participant; a single missing
+   * commit stalls the head in Initializing forever (until Abort).
+   *
+   * Today every party commits empty (`{}`) — each node owns its
+   * cardano-signing-key, so for an empty commit it builds, signs, and
+   * submits its own commit tx. Watch for one `Committed` per party,
+   * then `HeadIsOpen`, on the WS stream.
+   *
+   * Swap point (game-state init): party 0 (the referee) is where the
+   * treasury UTxO commit goes — replace its `{}` body with the funded
+   * UTxO that the post-open genesis tx will split into per-player
+   * Position/Bullets/Health UTxOs. Player parties keep committing empty.
+   *
+   * Failure stance: best-effort, guarded to fire once (parity with the
+   * old single-commit behaviour). A failed party commit is logged loudly
+   * — the observable symptom is waitUntilOpen() timing out, and the
+   * recovery path is closeHead()'s Abort branch.
+   */
+  private async sendInitialCommits(): Promise<void> {
     if (this.committed) return;
     this.committed = true;
 
-    // Convert ws://hydra-<id>:4001/?history=no → http://hydra-<id>:4001/commit
-    const httpBase = this.opts.sidecarUrl
-      .replace(/^ws:/, 'http:')
-      .replace(/\?.*$/, '')
-      .replace(/\/$/, '');
-    const url = `${httpBase}/commit`;
+    const urls = this.opts.partyApiUrls;
+    this.log(`committing for ${urls.length} part${urls.length === 1 ? 'y' : 'ies'}`);
 
-    this.log(`POST ${url} (empty commit)`);
-    try {
-      // Node 18+ has global fetch. If you're on 16, swap to node-fetch
-      // or the built-in `http` module.
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      });
-      const bodyText = await res.text();
-      if (!res.ok) {
-        this.log(`commit HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
-        return;
-      }
-      this.log(`commit accepted (${bodyText.length} bytes returned)`);
-      // hydra-node 1.x: an empty commit returns a balanced+signed tx
-      // that the node itself submits — there's nothing to do with the
-      // response body. Watch for the `Committed` then `HeadIsOpen`
-      // events on the WS stream.
-    } catch (err) {
-      this.log(`commit POST failed: ${(err as Error).message}`);
+    const results = await Promise.allSettled(
+      urls.map((base, i) => this.commitParty(i, base)),
+    );
+
+    const failed = results
+      .map((r, i) => (r.status === 'rejected' ? i : -1))
+      .filter((i) => i >= 0);
+    if (failed.length > 0) {
+      this.log(
+        `WARNING: commit failed for part${failed.length === 1 ? 'y' : 'ies'} ` +
+        `[${failed.join(', ')}] — head will stall in Initializing; ` +
+        `expect waitUntilOpen() to time out and closeHead() to Abort`,
+      );
     }
+  }
+
+  /** Commit for a single party. Party 0 is the referee — see the
+   *  treasury swap point in sendInitialCommits() above. */
+  private async commitParty(index: number, baseUrl: string): Promise<void> {
+    const url = `${stripTrailingSlash(baseUrl)}/commit`;
+    this.log(`POST ${url} (party ${index}, empty commit)`);
+
+    // Node 18+ has global fetch. If you're on 16, swap to node-fetch
+    // or the built-in `http` module.
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const bodyText = await res.text();
+    if (!res.ok) {
+      this.log(`party ${index} commit HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
+      throw new Error(`commit HTTP ${res.status}`);
+    }
+    this.log(`party ${index} commit accepted (${bodyText.length} bytes returned)`);
   }
 
   private log(msg: string): void {
@@ -257,6 +305,10 @@ export class HydraHeadController {
 
 function shortId(uuid: string): string {
   return uuid.slice(0, 8);
+}
+
+function stripTrailingSlash(u: string): string {
+  return u.replace(/\/$/, '');
 }
 
 /** Pull a short, log-friendly fingerprint out of a vk envelope without

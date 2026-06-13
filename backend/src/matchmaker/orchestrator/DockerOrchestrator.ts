@@ -3,25 +3,61 @@
  * host's Docker socket. Dev/local-only — production should use the
  * Kubernetes-backed implementation.
  *
- * Per match, spawns TWO containers on `ada-battles-net`:
+ * Per match, spawns 1 + (maxPlayers + 1) containers on `ada-battles-net`:
  *
- *   runner-<lobbyId>   the game server (this codebase, port 3000)
- *   hydra-<lobbyId>    the hydra-node sidecar (upstream image, port 4001)
+ *   runner-<lobbyId>        the game server (this codebase, port 3000)
+ *   hydra-<lobbyId>         party 0 — the REFEREE hydra-node
+ *   hydra-<lobbyId>-p1..pN  parties 1..N — one hydra-node per player slot
  *
- * The runner reaches its sidecar at ws://hydra-<lobbyId>:4001/. The
- * matchmaker tracks only the runner via SpawnResult — the sidecar is
- * an implementation-private sibling, reaped together with the runner
- * by stop(). This keeps OrchestratorSPI unchanged; K8s will use a
- * two-container Pod as the same abstraction.
+ * MULTI-PARTY TOPOLOGY (N+1)
+ * --------------------------
+ * One hydra-node hosts exactly one head party, so N+1 participants means
+ * N+1 node containers, fully meshed via --peer on the match network.
+ * Party 0 keeps the old `hydra-<lobbyId>` alias so the runner's
+ * HYDRA_SIDECAR_URL wiring is unchanged; the runner additionally gets
+ * HYDRA_PARTY_API_URLS (comma-separated, party 0 first) because with
+ * multiple parties EVERY node must receive a commit for the head to
+ * open — HydraHeadController.sendInitialCommit() must loop these URLs
+ * (referee commits the treasury UTxO, players commit empty `{}`).
+ *
+ * CUSTODIAL CAVEAT (read this twice)
+ * ----------------------------------
+ * Party keys are pre-provisioned on the matchmaker host and mounted into
+ * operator-run containers, i.e. the operator holds every party's
+ * hydra.sk. That exercises the real multi-party machinery (N-of-N
+ * snapshot signing, per-party contest rights at close) but provides NO
+ * adversarial protection for players — whoever holds the signing key
+ * owns the contest right. True player parties require client-held keys
+ * and (eventually) player-run nodes; at that point sidecar spawn must
+ * move from match-creation time to lobby-full time, because peer vks are
+ * boot-time CLI flags.
+ *
+ * EXPECTED KEY LAYOUT under `hydraDevKeysHostPath` (was: flat bundle):
+ *
+ *   <root>/
+ *   ├── shared/
+ *   │   ├── protocol-parameters.json   zero-fee L2 ledger params
+ *   │   └── blockfrost-project.txt     preprod project id
+ *   └── parties/
+ *       ├── p0/   hydra.sk hydra.vk cardano.sk cardano.vk   (referee)
+ *       ├── p1/   …                                          (player slot 1)
+ *       └── pK/   …  — provision at least MAX_PLAYERS + 1 dirs
+ *
+ * Every party's cardano.sk address MUST hold fuel ada on preprod: each
+ * node pays its own L1 fees (Init/Commit/Close/Contest/Fanout) from it.
+ * Recycle a pre-funded pool of party dirs across matches rather than
+ * faucet-per-match.
+ *
+ * PROTOCOL INVARIANTS the loop below must keep identical across parties,
+ * or Init is ignored / nodes diverge: --contestation-period, the ledger
+ * protocol-parameters file, --network, and the hydra-node image version.
+ *
  *
  * Sidecar lifecycle (decision (ii) from HANDOFF): runner.ts owns it.
- * Boot order is: spawn sidecar → spawn runner → runner connects.
- * Shutdown is reverse but driven by the runner: runner closes its
- * sidecar client and exits, then the matchmaker's stop() reaps both.
- *
- * Slice 1 runs the sidecar in offline mode (--offline-head-seed +
- * --initial-utxo) so no cardano-node is required. Slice 2 will need
- * a real cardano-node mount and per-match keys.
+ * Boot order: spawn all parties → spawn runner → runner connects.
+ * Shutdown is reverse but driven by the runner: runner drives the Head
+ * to a terminal state and exits, then the matchmaker's stop() reaps the
+ * runner and ALL party containers.
  */
 
 import Docker from 'dockerode';
@@ -39,16 +75,22 @@ export interface DockerOrchestratorOptions {
   /** Port the runner listens on inside the container. */
   runnerPort?: number;
 
-  /** Image for the hydra-node sidecar.
-   *  Pinned: ghcr.io/cardano-scaling/hydra-node:2.0.0 */
+  /** Image for the hydra-node sidecars.
+   *  Pinned: ghcr.io/cardano-scaling/hydra-node:2.0.0
+   *  Must be the SAME image for every party in a head. */
   hydraImage: string;
-  /** API port inside the sidecar container. */
+  /** API port inside each sidecar container (WS + HTTP). */
   hydraApiPort?: number;
+  /** Hydra network (peer/etcd) port inside each sidecar container. */
+  hydraNetworkPort?: number;
+  /** Memory cap per hydra-node container, in bytes. Default 512 MiB. */
+  hydraMemoryBytes?: number;
   /**
-   * Host directory containing the dev key bundle:
-   *   hydra.sk, hydra.vk, initial-utxo.json, protocol-parameters.json
-   * Bind-mounted into each sidecar at /run/hydra/.
-   * Slice 1 only — slice 2 will generate per-match keys.
+   * Host directory containing the party key pool + shared config in the
+   * layout documented in the header comment. Bind-mounted READ-ONLY into
+   * every sidecar at /run/hydra/ — note this means every node can read
+   * every party's signing key, which is acceptable only while all
+   * parties are operator-hosted (see CUSTODIAL CAVEAT above).
    */
   hydraDevKeysHostPath: string;
   /** Auth secret shared with the runner. */
@@ -57,41 +99,66 @@ export interface DockerOrchestratorOptions {
 
 export class DockerOrchestrator implements OrchestratorSPI {
   private readonly docker: Docker;
-  private readonly runnerPort:   number;
-  private readonly hydraApiPort: number;
+  private readonly runnerPort:       number;
+  private readonly hydraApiPort:     number;
+  private readonly hydraNetworkPort: number;
+  private readonly hydraMemoryBytes: number;
 
   /**
-   * Tracks sidecar container IDs by runner container ref. Reaped by
-   * stop() so the sidecar doesn't outlive its runner.
+   * Tracks ALL party container IDs by runner container ref (party 0
+   * first). Reaped by stop() so no sidecar outlives its runner.
    * Implementation detail — never exposed.
    */
-  private readonly sidecarByRunner = new Map<string, string>();
+  private readonly sidecarsByRunner = new Map<string, string[]>();
 
   constructor(private readonly opts: DockerOrchestratorOptions) {
-    this.docker       = new Docker();
-    this.runnerPort   = opts.runnerPort   ?? 3000;
-    this.hydraApiPort = opts.hydraApiPort ?? 4001;
+    this.docker           = new Docker();
+    this.runnerPort       = opts.runnerPort       ?? 3000;
+    this.hydraApiPort     = opts.hydraApiPort     ?? 4001;
+    this.hydraNetworkPort = opts.hydraNetworkPort ?? 5001;
+    this.hydraMemoryBytes = opts.hydraMemoryBytes ?? 512 * 1024 * 1024;
   }
 
   async spawn(req: SpawnRequest): Promise<SpawnResult> {
     const runnerName = `runner-${req.lobbyId}`;
-    const hydraName  = `hydra-${req.lobbyId}`;
+    // Party 0 (referee) keeps the legacy alias; players get -p<i>.
+    const partyCount = req.maxPlayers + 1;
+    const partyAliases = Array.from({ length: partyCount }, (_, i) =>
+      i === 0 ? `hydra-${req.lobbyId}` : `hydra-${req.lobbyId}-p${i}`,
+    );
 
-    // 1. Spawn the sidecar FIRST so the runner can connect on boot.
-    //    If runner came up first it'd hit STARTUP_RETRIES on the
-    //    HydraSidecarClient, which works but wastes ~10s.
-    const sidecar = await this.spawnSidecar(req.lobbyId, hydraName);
-
-    let runnerContainer: Docker.Container;
+    // 1. Spawn ALL party nodes FIRST so the runner can connect on boot,
+    //    and so the full mesh is resolvable the moment any node tries to
+    //    reach a peer. If any spawn fails, roll back the ones already up.
+    const sidecars: Docker.Container[] = [];
     try {
-      runnerContainer = await this.spawnRunner(req, runnerName, hydraName);
+      for (let i = 0; i < partyCount; i++) {
+        sidecars.push(
+          await this.spawnPartyNode(req.lobbyId, i, partyAliases),
+        );
+      }
     } catch (err) {
-      // Roll back the sidecar so we don't leak it.
-      await this.stopContainer(sidecar.id).catch(() => {});
+      await Promise.all(
+        sidecars.map((c) => this.stopContainer(c.id).catch(() => {})),
+      );
       throw err;
     }
 
-    this.sidecarByRunner.set(runnerContainer.id, sidecar.id);
+    let runnerContainer: Docker.Container;
+    try {
+      runnerContainer = await this.spawnRunner(req, runnerName, partyAliases);
+    } catch (err) {
+      // Roll back every party node so we don't leak the mesh.
+      await Promise.all(
+        sidecars.map((c) => this.stopContainer(c.id).catch(() => {})),
+      );
+      throw err;
+    }
+
+    this.sidecarsByRunner.set(
+      runnerContainer.id,
+      sidecars.map((c) => c.id),
+    );
 
     return {
       containerRef: runnerContainer.id,
@@ -101,14 +168,14 @@ export class DockerOrchestrator implements OrchestratorSPI {
   }
 
   async stop(containerRef: string): Promise<void> {
-    // Stop the runner first — it'll send Close to its sidecar on its
-    // way out (slice 2 semantics; slice 1 is a no-op clean close).
+    // Stop the runner first — it drives Close → Fanout on its way out,
+    // which needs the party nodes still up. Only then reap the mesh.
     await this.stopContainer(containerRef);
 
-    const sidecarId = this.sidecarByRunner.get(containerRef);
-    if (sidecarId) {
-      this.sidecarByRunner.delete(containerRef);
-      await this.stopContainer(sidecarId);
+    const sidecarIds = this.sidecarsByRunner.get(containerRef);
+    if (sidecarIds) {
+      this.sidecarsByRunner.delete(containerRef);
+      await Promise.all(sidecarIds.map((id) => this.stopContainer(id)));
     }
   }
 
@@ -117,8 +184,17 @@ export class DockerOrchestrator implements OrchestratorSPI {
   private async spawnRunner(
     req: SpawnRequest,
     runnerName: string,
-    hydraName:  string,
+    partyAliases: string[],
   ): Promise<Docker.Container> {
+    const refereeAlias = partyAliases[0];
+    // http://<alias>:4001 per party, party 0 (referee) first. The
+    // HydraHeadController uses these to POST /commit to EVERY party —
+    // a multi-party head will not reach Open until each node has
+    // committed (players commit empty).
+    const partyApiUrls = partyAliases
+      .map((a) => `http://${a}:${this.hydraApiPort}`)
+      .join(',');
+
     const container = await this.docker.createContainer({
       Image: this.opts.runnerImage,
       name:  runnerName,
@@ -128,9 +204,11 @@ export class DockerOrchestrator implements OrchestratorSPI {
         `PORT=${this.runnerPort}`,
         `IDLE_SHUTDOWN_MS=${5 * 60 * 1000}`,
         `AUTH_SECRET=${this.opts.authSecret}`,
-        // NEW: where the sidecar is reachable from inside the runner
-        // container. Same network, alias resolves to sidecar's IP.
-        `HYDRA_SIDECAR_URL=ws://${hydraName}:${this.hydraApiPort}/?history=no`,
+        // Observer/controller WS target — unchanged: the referee node.
+        `HYDRA_SIDECAR_URL=ws://${refereeAlias}:${this.hydraApiPort}/?history=no`,
+        // NEW: full party roster for per-party commit driving.
+        `HYDRA_PARTY_API_URLS=${partyApiUrls}`,
+        `HYDRA_PARTY_COUNT=${partyAliases.length}`,
       ],
       Cmd: ['node', 'dist/backend/src/runner.js'],
       HostConfig: {
@@ -154,49 +232,70 @@ export class DockerOrchestrator implements OrchestratorSPI {
     return container;
   }
 
-  private async spawnSidecar(
-    lobbyId:   string,
-    hydraName: string,
+  /**
+   * Spawn hydra-node party <index> of the match's N+1 mesh.
+   *
+   * Online/preprod flags, per party:
+   *   --hydra-signing-key / --cardano-signing-key   OWN keys (parties/p<i>/)
+   *   --peer + --hydra-verification-key
+   *          + --cardano-verification-key           one triple PER OTHER party,
+   *                                                 in the same order on every
+   *                                                 node (j ascending, j ≠ i)
+   *   --host / --port                               peer (etcd) listener; the
+   *                                                 alias:port other nodes dial
+   *   --contestation-period / ledger params         MUST match across parties
+   *
+   * What we deliberately do NOT do: generate keys here. Key dirs are a
+   * pre-provisioned, pre-FUNDED pool (see header). A missing parties/p<i>
+   * dir fails fast at node boot with a clear file-not-found.
+   */
+  private async spawnPartyNode(
+    lobbyId:      string,
+    index:        number,
+    partyAliases: string[],
   ): Promise<Docker.Container> {
-    // Offline mode flags (hydra 1.x):
-    //   --offline-head-seed <hex>     32 bytes of hex; identifies the
-    //                                 offline "head" deterministically
-    //   --initial-utxo <file>         JSON UTxO seed; empty {} is valid
-    //   --ledger-protocol-parameters  protocol params for the L2 ledger
-    //   --hydra-signing-key           hydra (not cardano) signing key
-    //   --api-host / --api-port       WS+HTTP API bind
-    //   --persistence-dir             event log; per-container tmpfs is fine
-    //
-    // We deliberately do NOT pass --node-socket, --cardano-signing-key,
-    // --hydra-scripts-tx-id, --peer, --testnet-magic. None of those
-    // are valid when offline. Slice 2 (online) adds them all.
-    //
-    // Seed derivation: take 16 bytes of the lobbyId UUID (32 hex chars)
-    // and zero-pad to 32 bytes. Stable per lobby, irrelevant otherwise.
+    const alias = partyAliases[index];
+    const me    = `/run/hydra/parties/p${index}`;
+
+    // Fully meshed peer wiring: one (--peer, hydra-vk, cardano-vk)
+    // triple per OTHER party. Deterministic order so every node sees an
+    // identical participant set — the head ID derives from it.
+    const peerArgs = partyAliases.flatMap((peerAlias, j) => {
+      if (j === index) return [];
+      return [
+        '--peer', `${peerAlias}:${this.hydraNetworkPort}`,
+        '--hydra-verification-key',   `/run/hydra/parties/p${j}/hydra.vk`,
+        '--cardano-verification-key', `/run/hydra/parties/p${j}/cardano.vk`,
+      ];
+    });
 
     const container = await this.docker.createContainer({
       Image: this.opts.hydraImage,
-      name:  hydraName,
+      name:  alias,
       Cmd: [
-        '--node-id', `online-${lobbyId.slice(0, 8)}`,
-        // Chain backend: Blockfrost instead of --node-socket/--testnet-magic.
-        // The project file's network determines the chain (preprod here).
-        '--blockfrost', '/run/hydra/blockfrost-project.txt',
-        // Pre-published hydra scripts for v1.2.0 on preprod. Either form works:
-        //   --network preprod                          (uses bundled networks.json)
-        //   --hydra-scripts-tx-id <tx1>,<tx2>,<tx3>    (explicit pin)
+        '--node-id', `p${index}-${lobbyId.slice(0, 8)}`,
+        // Chain backend: Blockfrost; the project file's network must be
+        // preprod to match --network below.
+        '--blockfrost', '/run/hydra/shared/blockfrost-project.txt',
+        // Pre-published hydra scripts for the pinned node version.
         '--network', 'preprod',
-        // L1 fuel key. The hydra-node pays its own L1 fees from this UTxO.
-        '--cardano-signing-key', '/run/hydra/cardano.sk',
-        // Participant set: just our own vk for now (see "caveat" below).
-        '--hydra-signing-key', '/run/hydra/hydra.sk',
-        // L2 ledger config — unchanged from offline.
-        '--ledger-protocol-parameters', '/run/hydra/protocol-parameters.json',
-        // Short contestation period for testing. Default is 12h. 60s is fine on preprod;
-        // do NOT use a short value on mainnet (see Hydra docs on the safe zone).
+        // OWN identity. The cardano key pays this party's L1 fees
+        // (Init/Commit/Close/Contest/Fanout) — it must hold fuel.
+        '--cardano-signing-key', `${me}/cardano.sk`,
+        '--hydra-signing-key',   `${me}/hydra.sk`,
+        // The rest of the mesh.
+        ...peerArgs,
+        // Peer/etcd listener this node binds; peers dial alias:port.
+        '--host', '0.0.0.0',
+        '--port', String(this.hydraNetworkPort),
+        // L2 ledger config — identical file for every party.
+        '--ledger-protocol-parameters', '/run/hydra/shared/protocol-parameters.json',
+        // Identical on all parties or Init is ignored. 60s is fine on
+        // preprod; do NOT use a short value on mainnet (safe zone).
         '--contestation-period', '60s',
         '--unsynced-period', '300s',
-        // API binding — unchanged.
+        // API binding — every party exposes WS+HTTP on the same port;
+        // the runner talks WS only to party 0 but POSTs /commit to all.
         '--api-host', '0.0.0.0',
         '--api-port', String(this.hydraApiPort),
         '--persistence-dir', '/tmp/hydra-state',
@@ -204,23 +303,24 @@ export class DockerOrchestrator implements OrchestratorSPI {
       HostConfig: {
         AutoRemove:    false,
         NetworkMode:   this.opts.network,
-        Memory:        512 * 1024 * 1024,  // hydra-node is heavier than the runner
+        Memory:        this.hydraMemoryBytes,
         NanoCpus:      500_000_000,
         RestartPolicy: { Name: 'no' },
         Binds: [
-          // Read-only key bundle. Mounted from a path on the matchmaker
-          // host that compose has already validated exists.
+          // Whole key pool, read-only, into every node. Acceptable ONLY
+          // while all parties are operator-hosted — see header caveat.
           `${this.opts.hydraDevKeysHostPath}:/run/hydra:ro`,
         ],
       },
       NetworkingConfig: {
         EndpointsConfig: {
-          [this.opts.network]: { Aliases: [hydraName] },
+          [this.opts.network]: { Aliases: [alias] },
         },
       },
       Labels: {
-        'ada-battles.role':    'hydra-sidecar',
-        'ada-battles.lobbyId': lobbyId,
+        'ada-battles.role':       'hydra-sidecar',
+        'ada-battles.lobbyId':    lobbyId,
+        'ada-battles.hydraParty': String(index),
       },
     });
     await container.start();

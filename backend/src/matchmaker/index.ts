@@ -18,13 +18,23 @@ const PUBLIC_PORT    = process.env.PUBLIC_PORT    ?? '8080';
 
 const HYDRA_NODE_IMAGE         = process.env.HYDRA_NODE_IMAGE
   ?? 'ghcr.io/cardano-scaling/hydra-node:2.0.0';
+// N+1 layout root (shared/ + parties/p0..pK/) — see the header of
+// DockerOrchestrator.ts for the exact expected contents, and the
+// Makefile's hydra-party-keys target for provisioning it.
 const HYDRA_DEV_KEYS_HOST_PATH = required('HYDRA_DEV_KEYS_HOST_PATH');
+// Optional N+1 tuning knobs; the orchestrator defaults are 5001 / 512 MiB.
+const HYDRA_NETWORK_PORT = numberOrUndefined(process.env.HYDRA_NETWORK_PORT);
+const HYDRA_MEMORY_MB    = numberOrUndefined(process.env.HYDRA_MEMORY_MB);
 
 const orchestrator = new DockerOrchestrator({
   runnerImage:          RUNNER_IMAGE,
   network:              RUNNER_NETWORK,
   hydraImage:           HYDRA_NODE_IMAGE,
   hydraDevKeysHostPath: HYDRA_DEV_KEYS_HOST_PATH,
+  hydraNetworkPort:     HYDRA_NETWORK_PORT,
+  hydraMemoryBytes:     HYDRA_MEMORY_MB !== undefined
+    ? HYDRA_MEMORY_MB * 1024 * 1024
+    : undefined,
   authSecret:           AUTH_SECRET,
 });
 
@@ -58,4 +68,10 @@ function required(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`${name} env var required`);
   return v;
+}
+
+function numberOrUndefined(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
 }

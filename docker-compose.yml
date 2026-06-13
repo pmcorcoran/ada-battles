@@ -1,10 +1,11 @@
 # Local dev orchestration.
 #
 # `docker compose up` boots just the matchmaker. It spawns lobby-runner
-# containers on demand via the host Docker socket, AND a per-runner
-# hydra-node sidecar (one Hydra container per match). All three share
-# the `ada-battles-net` network so the matchmaker can reach runners by
-# container name, runners can reach their sidecars by alias, and
+# containers on demand via the host Docker socket, AND a per-match
+# hydra-node MESH (N+1 containers per match: one referee node plus one
+# node per player slot, fully peered). Everything shares the
+# `ada-battles-net` network so the matchmaker can reach runners by
+# container name, runners can reach their party nodes by alias, and
 # clients can reach runners through the matchmaker's returned URL.
 #
 # Browser clients connect to:
@@ -36,16 +37,33 @@ services:
       AUTH_SECRET:      "${AUTH_SECRET}"
       ALLOWED_ORIGINS:  "http://localhost:3000"
 
-      # ── Hydra sidecar config (slice 1: offline mode) ──
+      # ── Hydra sidecar config (N+1 party mesh, preprod) ──
       # Pin the hydra-node image. Bump deliberately — API events
-      # and flags have moved across versions.
+      # and flags have moved across versions. Every party in a head
+      # MUST run the same image.
       HYDRA_NODE_IMAGE: "ghcr.io/cardano-scaling/hydra-node:2.0.0"
-      # HOST path (not container path) to the dev-keys bundle. The
+      # HOST path (not container path) to the party key POOL. The
       # matchmaker passes this through to docker.createContainer as
       # a bind source, which Docker resolves on the host. Compose
       # substitutes ${PWD} at up-time. If you move the repo, update
       # this — there's no way to derive it from inside the container.
-      HYDRA_DEV_KEYS_HOST_PATH: "${PWD}/infra/hydra-dev-keys"
+      #
+      # Expected layout (provision with `make hydra-party-keys` and
+      # fund every parties/p*/cardano.vk address on preprod — see
+      # `make hydra-party-addresses`):
+      #
+      #   infra/hydra-parties/
+      #   ├── shared/
+      #   │   ├── protocol-parameters.json
+      #   │   └── blockfrost-project.txt
+      #   └── parties/
+      #       ├── p0/  hydra.{sk,vk} cardano.{sk,vk}   (referee)
+      #       ├── p1/  …                                (player slot 1)
+      #       └── p5/  …  (provision MAX_PLAYERS + 1 = up to 6 dirs)
+      HYDRA_DEV_KEYS_HOST_PATH: "${PWD}/infra/hydra-parties"
+      # Optional N+1 tuning (defaults: 5001 / 512):
+      # HYDRA_NETWORK_PORT: "5001"
+      # HYDRA_MEMORY_MB:    "512"
     volumes:
       # Allow the matchmaker to spawn sibling containers via the host's
       # Docker socket. In production, use a Kubernetes ServiceAccount
@@ -67,10 +85,10 @@ networks:
 # ── Notes ──────────────────────────────────────────────────────────
 #
 # Why is there only one service here?
-# Runners AND sidecars are *spawned by the matchmaker*, not declared
+# Runners AND party nodes are *spawned by the matchmaker*, not declared
 # in compose. The matchmaker calls the Docker API to create them as
 # siblings on the same network. Compose owns the matchmaker; the
-# matchmaker owns runner+sidecar pairs.
+# matchmaker owns runner + hydra-node meshes.
 #
 # Reaching runners from the browser:
 # The matchmaker runs a WS-proxying reverse proxy that routes
@@ -79,10 +97,11 @@ networks:
 # an ingress (nginx, Traefik, k8s Ingress) doing the same path-based
 # routing.
 #
-# Sidecars are NEVER browser-exposed. The hydra-node API at port 4001
-# is reachable only from inside the docker network, addressed as
-# hydra-<lobbyId>:4001 by the runner.
+# Party nodes are NEVER browser-exposed. The hydra-node APIs at port
+# 4001 are reachable only from inside the docker network, addressed as
+# hydra-<lobbyId> (referee) and hydra-<lobbyId>-p<i> (players) by the
+# runner.
 #
-# Cleaning up dangling runners + sidecars after a crash:
+# Cleaning up dangling runners + party nodes after a crash:
 #   docker ps --filter "label=ada-battles.role=lobby-runner"   -q | xargs -r docker rm -f
 #   docker ps --filter "label=ada-battles.role=hydra-sidecar"  -q | xargs -r docker rm -f
